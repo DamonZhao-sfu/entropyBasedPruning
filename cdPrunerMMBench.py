@@ -1,8 +1,3 @@
-import torch
-import torch.nn.functional as F
-from PIL import Image
-from cdencoder import CLIPVisionTower
-from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 import time
 import torch
 import numpy as np
@@ -12,15 +7,12 @@ import json
 import io
 import base64
 import os
-import csv
-import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
 from datetime import datetime
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
-from cdencoder import CLIPVisionTower
-
-vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+from cdencoder import CLIPVisionTower  # Assuming first file is saved as clipEncoder.py
+vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
 class MockArgs:
     def __init__(self):
         self.mm_vision_select_layer = -2
@@ -30,6 +22,94 @@ mock_args = MockArgs()
 vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
 vision_tower = vision_tower.to("cuda")
 
+def getPrunedVisualToken(model, image_path, texts):
+    image = Image.open(image_path)        
+    inputs = vision_tower.image_processor(image, return_tensors="pt")
+    images = inputs["pixel_values"]
+    image_stream = torch.cuda.Stream()
+    text_stream = torch.cuda.Stream()
+    
+    model_device = vision_tower.device
+
+    with torch.cuda.stream(image_stream):
+        image_forward_outs = vision_tower.vision_tower(images.to(device=vision_tower.device, dtype=vision_tower.dtype), output_hidden_states=True)
+        image_outputs = vision_tower.feature_select(image_forward_outs)
+        image_features = image_outputs.to(images.dtype)
+    
+    if texts is not None:
+        with torch.cuda.stream(text_stream):
+            text_inputs = vision_tower.text_tokenizer(text=texts, return_tensors="pt")
+            text_segment = (text_inputs.input_ids.shape[1] - 1) // vision_tower.max_position_embeddings + 1
+            text_padding = vision_tower.max_position_embeddings * text_segment - text_inputs.input_ids.shape[1]
+            text_inputs = {
+                k: torch.cat([v, v.new_zeros((v.shape[0], text_padding))], 
+                                dim=1).reshape(-1, vision_tower.max_position_embeddings).to(device=vision_tower.device)
+                for k, v in text_inputs.items()
+            }
+            # Keep text_embeds on GPU
+            text_embeds = vision_tower.text_tower(**text_inputs).text_embeds
+    
+    torch.cuda.synchronize()
+
+    if texts is not None:
+        image_embeds = vision_tower.vision_tower.vision_model.post_layernorm(image_outputs)
+        image_embeds = vision_tower.vision_tower.visual_projection(image_embeds.float())
+
+    B, N, C = image_features.shape
+    
+    # Move image_features to the same device as the model BEFORE applying projection
+    image_features = image_features.to(device=model_device, dtype=torch.float16)
+    
+    # Ensure all tensors are on the same device as the model
+    image_embeds = image_embeds.to(device=model_device)
+    text_embeds = text_embeds.to(device=model_device)
+    
+    # print(f"Before projection - image_features device: {image_features.device}")
+    # print(f"Model multi_modal_projector device: {model_device}")
+    model.multi_modal_projector = model.multi_modal_projector.to(model_device)
+
+    # Apply projection - now both tensors are on the same device
+    image_features = model.multi_modal_projector(image_features)
+
+    # [CDPruner] Calculate cosine similarity - ALL ON SAME DEVICE
+    image_normalized = image_features / image_features.norm(dim=-1, keepdim=True)  # (B, N, D)
+    image_normalized = image_normalized.float()  # (B, N, D)
+    similarity = torch.matmul(image_normalized, image_normalized.transpose(1, 2))  # (B, N, N)
+
+    # [CDPruner] Calculate query relevance - ALL ON SAME DEVICE
+    image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)  # (B, N, C)
+    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)  # (M, C)
+    relevance = torch.matmul(image_embeds, text_embeds.t())  # (B, N, M)
+    relevance = (-relevance).mean(dim=-1)  # (B, N)
+    relevance = (relevance - relevance.min() + 1e-6) / (relevance.max() - relevance.min())  # (B, N)
+
+    # [CDPruner] Construct kernel matrix - ALL ON SAME DEVICE
+    kernel = relevance.unsqueeze(2) * similarity * relevance.unsqueeze(1)  # (B, N, N)
+    
+    # [CDPruner] Fast MAP inference of conditional DPP - ALL ON SAME DEVICE
+    cis = torch.zeros((144, B, N), device=model_device)  # (T, B, N)
+    di2s = torch.diagonal(kernel, dim1=1, dim2=2).clone()  # (B, N)
+    select_idx = torch.empty((144, B), dtype=torch.long, device=model_device)  # (T, B)
+    
+    for i in range(144):
+        j = torch.argmax(di2s, dim=-1)
+        select_idx[i] = j
+
+        eis = (kernel[torch.arange(B), j] - torch.einsum('tb,tbn->bn', cis[:i, torch.arange(B), j], cis[:i])) \
+            / torch.sqrt(di2s[torch.arange(B), j]).unsqueeze(-1)
+        cis[i, :, :] = eis
+        di2s -= torch.square(eis)
+        di2s[torch.arange(B), j] = -float('inf')
+    
+    select_idx = torch.sort(select_idx.t()).values  # (B, T)
+    index_masks = torch.zeros(B, N, dtype=torch.bool, device=model_device)
+    index_masks.scatter_(1, select_idx, True)
+    
+    # Apply mask and move final result to CPU only at the very end
+    image_features_selected = image_features[index_masks].unsqueeze(0).detach().cpu()
+    print(f"Final output shape: {image_features_selected.shape}")
+    
+    return image_features_selected
 
 def encode_image_embedding_to_base64(image_embedding):
     """
@@ -306,260 +386,11 @@ def call_vllm_api(image_embedding=None, image_path=None, question="What's in thi
             raise ValueError("image_embedding must be provided when use_image_path=False")
         return call_vllm_api_with_embeds(image_embedding, question, model, api_url)
 
-
-def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
-    """
-    Compute pruning scores with mutual information approximation.
-    
-    Args:
-        attention_matrix: [num_text_tokens, num_image_tokens] attention matrix
-        lambda_val: Hyperparameter for entropy weight
-        alpha: Weight for mutual information term
-    
-    Returns:
-        scores: Comprehensive score for each image token
-    """
-    I = attention_matrix.sum(dim=0)  # Importance score [num_image_tokens]
-    attention_per_image_token = attention_matrix / (attention_matrix.sum(dim=0, keepdim=True) + 1e-10)
-    attention_per_image_token = torch.clamp(attention_per_image_token, min=1e-10)
-    H = - (attention_per_image_token * torch.log(attention_per_image_token)).sum(dim=0)  # Entropy
-    
-    # Approximate mutual information: higher variance in attention indicates higher unique contribution
-    attention_variance = torch.var(attention_per_image_token, dim=0)  # [num_image_tokens]
-    mi_approx = attention_variance / (attention_variance.max() + 1e-10)  # Normalize
-    
-    scores = alpha * I + (1 - alpha) * mi_approx - lambda_val * H
-    return scores
-
-# def compute_pruning_scores(attention_matrix, lambda_val):
-#     """
-#     Compute comprehensive scores for each image token, combining attention score and entropy.
-    
-#     Args:
-#         attention_matrix: [num_text_tokens, num_image_tokens] attention matrix
-#         lambda_val: Hyperparameter to balance importance and entropy
-    
-#     Returns:
-#         scores: Comprehensive score for each image token
-#     """
-#     I = attention_matrix.sum(dim=0)  # [num_image_tokens]
-#     attention_per_image_token = attention_matrix / (attention_matrix.sum(dim=0, keepdim=True) + 1e-10)
-#     attention_per_image_token = torch.clamp(attention_per_image_token, min=1e-10)
-#     H = - (attention_per_image_token * torch.log(attention_per_image_token)).sum(dim=0)
-#     scores = I - lambda_val * H
-#     return scores
-
-
-def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=0.1):
-    # Load and preprocess image
-    image = Image.open(image_path)
-    inputs = vision_tower.image_processor(image, return_tensors="pt")
-    images = inputs["pixel_values"]
-    image_stream = torch.cuda.Stream()
-    text_stream = torch.cuda.Stream()
-    
-    model_device = vision_tower.device
-    
-    # Process image features
-    with torch.cuda.stream(image_stream):
-        image_forward_outs = vision_tower.vision_tower(
-            images.to(device=model_device, dtype=vision_tower.dtype),
-            output_hidden_states=True,
-            output_attentions=True
-        )
-        image_outputs = vision_tower.feature_select(image_forward_outs)
-        image_features = image_outputs.to(images.dtype)
-    
-    # Process text embeddings
-    if texts is not None:
-        with torch.cuda.stream(text_stream):
-            text_inputs = vision_tower.text_tokenizer(
-                text=texts, return_tensors="pt"
-            )
-            text_segment = (text_inputs.input_ids.shape[1] - 1) // vision_tower.max_position_embeddings + 1
-            text_padding = vision_tower.max_position_embeddings * text_segment - text_inputs.input_ids.shape[1]
-            text_inputs = {
-                k: torch.cat([v, v.new_zeros((v.shape[0], text_padding))], 
-                            dim=1).reshape(-1, vision_tower.max_position_embeddings).to(device=model_device)
-                for k, v in text_inputs.items()
-            }
-            text_embeds = vision_tower.text_tower(**text_inputs).text_embeds
-    
-            if text_embeds.dim() == 2:
-                text_embeds = text_embeds.unsqueeze(0)  # Add batch dimension if missing
-            elif text_embeds.dim() > 3:
-                # Handle cases where output might have extra dimensions
-                text_embeds = text_embeds.squeeze().reshape(1, -1, text_embeds.size(-1))
-    
-    torch.cuda.synchronize()
-    
-    # Project image features
-    B, N, C = image_features.shape
-    image_features = image_features.to(device=model_device, dtype=torch.float16)
-    model.multi_modal_projector = model.multi_modal_projector.to(model_device)
-    image_features = model.multi_modal_projector(image_features)
-    
-    # Get projected dimensions
-    projected_dim = image_features.shape[-1]  # This should be 4096
-    
-    # Compute text-guided attention matrix using text_embeds and image_features
-    if texts is not None:
-        # Ensure text_embeds and image_features are aligned in dimensionality
-        text_embeds = text_embeds.to(device=model_device, dtype=torch.float16)
-
-        # Check if dimensions match, if not, we need to project text_embeds
-        if text_embeds.shape[-1] != image_features.shape[-1]:
-            # Create a simple linear projection
-            projection_layer = torch.nn.Linear(text_embeds.shape[-1], image_features.shape[-1]).to(model_device).half()
-            text_embeds_projected = projection_layer(text_embeds)
-                    
-            # Compute similarity using projected text embeddings
-            attention_matrix = torch.bmm(text_embeds_projected, image_features.transpose(1, 2))  # [B, num_text_tokens, num_image_tokens]
-        else:
-            # Dimensions already match
-            attention_matrix = torch.bmm(text_embeds, image_features.transpose(1, 2))  # [B, num_text_tokens, num_image_tokens]
         
-        attention_matrix = F.softmax(attention_matrix, dim=-1)  # Normalize over image tokens
-        attention_matrix = attention_matrix.mean(dim=0)  # Average over batch: [num_text_tokens, num_image_tokens]
-    
-    # Compute pruning scores
-    scores = compute_pruning_scores(attention_matrix, lambda_val)
-    
-    # Select top-k tokens
-    num_image_tokens = N
-    num_tokens_to_keep = min(int(keep_ratio * num_image_tokens), num_image_tokens)
-    _, top_indices = torch.topk(scores, num_tokens_to_keep, dim=-1)
-    
-    # Validate indices
-    if (top_indices >= num_image_tokens).any() or (top_indices < 0).any():
-        raise ValueError(f"top_indices contains invalid values: {top_indices}")
-    
-    # Select pruned features
-    image_features_selected = image_features[:, top_indices, :]  # [B, num_tokens_to_keep, C]
-    image_features_selected = image_features_selected.detach().cpu()
-    
-    return image_features_selected
 
-def save_results_to_csv(results_data, filename="api_timing_results.csv"):
-    """
-    Save results data to CSV file
-    
-    Args:
-        results_data: List of dictionaries containing result data
-        filename: Output CSV filename
-    """
-    if not results_data:
-        print("No results data to save")
-        return
-    
-    # Define CSV headers
-    headers = [
-        'test_number', 'timestamp', 'image_path', 'question', 'correct_answer',
-        'predicted_answer', 'is_correct', 'api_success', 'original_tokens', 
-        'reduced_tokens', 'embed_time', 'api_call_time', 'total_time',
-        'generated_text', 'error_message', 'model_path', 'api_url', 'method'
-    ]
-    
-    try:
-        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=headers)
-            writer.writeheader()
-            writer.writerows(results_data)
-        
-        print(f"Results saved to {filename}")
-        
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
-
-
-def generate_timing_summary(results_data):
-    """
-    Generate and display timing summary statistics
-    
-    Args:
-        results_data: List of dictionaries containing result data
-    """
-    if not results_data:
-        print("No results data to summarize")
-        return
-    
-    # Filter successful API calls
-    successful_results = [r for r in results_data if r['api_success']]
-    
-    if not successful_results:
-        print("No successful API calls to summarize")
-        return
-    
-    # Convert to pandas DataFrame for easier analysis
-    df = pd.DataFrame(successful_results)
-    
-    print("\n" + "="*60)
-    print("TIMING SUMMARY REPORT")
-    print("="*60)
-    
-    print(f"Total Tests: {len(results_data)}")
-    print(f"Successful API Calls: {len(successful_results)}")
-    print(f"Success Rate: {len(successful_results)/len(results_data)*100:.1f}%")
-    
-    # Calculate timing statistics
-    timing_stats = {}
-    time_columns = ['embed_time', 'api_call_time', 'total_time']
-    
-    for col in time_columns:
-        if col in df.columns:
-            timing_stats[col] = {
-                'total': df[col].sum(),
-                'average': df[col].mean(),
-                'min': df[col].min(),
-                'max': df[col].max(),
-                'std': df[col].std()
-            }
-    
-    print("\n" + "-"*40)
-    print("TIMING STATISTICS (seconds)")
-    print("-"*40)
-    
-    for time_type, stats in timing_stats.items():
-        print(f"\n{time_type.replace('_', ' ').title()}:")
-        print(f"  Total:   {stats['total']:8.2f}s")
-        print(f"  Average: {stats['average']:8.2f}s")
-        print(f"  Min:     {stats['min']:8.2f}s")
-        print(f"  Max:     {stats['max']:8.2f}s")
-        print(f"  Std Dev: {stats['std']:8.2f}s")
-    
-    # Token statistics
-    if 'original_tokens' in df.columns and 'reduced_tokens' in df.columns:
-        print("\n" + "-"*40)
-        print("TOKEN STATISTICS")
-        print("-"*40)
-        
-        orig_tokens = df['original_tokens'].iloc[0] if len(df) > 0 else 0
-        avg_reduced = df['reduced_tokens'].mean() if 'reduced_tokens' in df.columns else 0
-        reduction_ratio = (orig_tokens - avg_reduced) / orig_tokens * 100 if orig_tokens > 0 else 0
-        
-        print(f"Original Tokens:     {orig_tokens}")
-        print(f"Average Reduced:     {avg_reduced:.1f}")
-        print(f"Reduction Ratio:     {reduction_ratio:.1f}%")
-    
-    # Accuracy statistics
-    if 'is_correct' in df.columns:
-        correct_predictions = df['is_correct'].sum()
-        total_predictions = len([r for r in successful_results if r['predicted_answer']])
-        accuracy = correct_predictions / total_predictions * 100 if total_predictions > 0 else 0
-        
-        print("\n" + "-"*40)
-        print("ACCURACY STATISTICS")
-        print("-"*40)
-        print(f"Correct Predictions: {correct_predictions}")
-        print(f"Total Predictions:   {total_predictions}")
-        print(f"Accuracy:           {accuracy:.1f}%")
-    
-    print("\n" + "="*60)
-
-if __name__ == "__main__":
+def main():
     MODEL_PATH = "/data/models/llava-1.5-7b-hf"
-    IMAGE_PATH = "/home/haikai/MMbench/extracted_images/0.jpg"
-    TEXTS = "Describe the main object in the image"
+    IMAGE_PATH = "/home/haikai/AI_UDF/sparkai/examples/python/35b31d9b4f723f806fd32662ef29edf7.jpg"
     API_URL = "http://localhost:8005"
 
     model = LlavaForConditionalGeneration.from_pretrained(
@@ -568,12 +399,16 @@ if __name__ == "__main__":
         device_map="cuda",
         attn_implementation="eager"
     )
-
+    
     processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
-    print("Comparing different token pruning methods...")    
+   
+    
+    print("Comparing different token pruning methods...")
+    
     # Initialize results storage
     results_data = []
     
+
     # Get sample images for testing
     spark = SparkSession.builder.appName("AudioVisualQAProcessor") \
         .master("local[*]") \
@@ -597,7 +432,7 @@ if __name__ == "__main__":
         col("B"), 
         col("C"),
         col("D"),
-    ).limit(1000).collect()
+    ).limit(100).collect()
     
     print(f"Testing {len(sample_data)} questions...")
     print("-" * 60)
@@ -652,7 +487,7 @@ if __name__ == "__main__":
 
                 embed_time = prune_time_end - prune_time_begin
                 result_record['original_token'] = 576
-                result_record['pruned_token'] = reduced_tokens
+                result_record['pruned_token'] = 0
                 result_record['preprocess_time'] = 0
                 result_record['encode_time'] = 0
                 result_record['project_time'] = 0
@@ -725,19 +560,83 @@ if __name__ == "__main__":
         results_data.append(result_record)
         print()
 
+    # # Calculate accuracy
+    # successful_tests = [r for r in results_data if r['api_success'] and r['predicted_answer']]
+    # if successful_tests:
+    #     accuracy = sum(1 for r in successful_tests if r['is_correct']) / len(successful_tests)
+    #     print(f"\nOverall Accuracy: {accuracy:.2%} ({sum(1 for r in successful_tests if r['is_correct'])}/{len(successful_tests)})")
 
-    # Save results to CSV
-    csv_filename = f"api_timing_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    save_results_to_csv(results_data, csv_filename)
-    
-    # Generate and display timing summary
-    generate_timing_summary(results_data)
-     # Calculate accuracy
-    successful_tests = [r for r in results_data if r['api_success'] and r['predicted_answer']]
-    if successful_tests:
-        accuracy = sum(1 for r in successful_tests if r['is_correct']) / len(successful_tests)
-        print(f"\nOverall Accuracy: {accuracy:.2%} ({sum(1 for r in successful_tests if r['is_correct'])}/{len(successful_tests)})")
+    # print(f"\nToken pruning with vLLM API completed successfully using {'direct image path' if USE_IMAGE_PATH else 'embedding'} method!")
+
+    # # Save results to CSV
+    # #results_df = pd.DataFrame(results_data)
+    # method_suffix = "cdprune"
+    # results_csv_path = f"llava_eval_results_{method_suffix}.csv"
+    # results_df.to_csv(results_csv_path, index=False)
+    # print(f"\nSaved detailed results to {results_csv_path}")
+
+    # # Calculate summary stats
+    # #successful = results_df[results_df['api_success'] & results_df['predicted_answer'].astype(bool)]
+
+    # summary = {}
+
+    # if not successful.empty:
+    #     summary['accuracy'] = successful['is_correct'].mean()
+    #     summary['accuracy_count'] = f"{successful['is_correct'].sum()}/{len(successful)}"
+    #     summary['method'] = 'direct_image_path' if USE_IMAGE_PATH else 'embeddings'
+
+    #     if not USE_IMAGE_PATH:
+    #         # Only calculate these stats for embedding method
+    #         summary['project_time_avg'] = successful['project_time'].mean()
+    #         summary['project_time_min'] = successful['project_time'].min()
+    #         summary['project_time_max'] = successful['project_time'].max()
+
+    #         summary['preprocess_time_avg'] = successful['preprocess_time'].mean()
+    #         summary['preprocess_time_min'] = successful['preprocess_time'].min()
+    #         summary['preprocess_time_max'] = successful['preprocess_time'].max()
+
+    #         summary['encode_time_avg'] = successful['encode_time'].mean()
+    #         summary['encode_time_min'] = successful['encode_time'].min()
+    #         summary['encode_time_max'] = successful['encode_time'].max()
+
+    #         summary['prune_time_avg'] = successful['prune_time'].mean()
+    #         summary['prune_time_min'] = successful['prune_time'].min()
+    #         summary['prune_time_max'] = successful['prune_time'].max()
+
+    #         summary['token_original_avg'] = successful['original_token'].mean()
+    #         summary['token_pruned_avg'] = successful['pruned_token'].mean()
+
+    #     summary['api_call_time_avg'] = successful['api_call_time'].mean()
+    #     summary['api_call_time_min'] = successful['api_call_time'].min()
+    #     summary['api_call_time_max'] = successful['api_call_time'].max()
+
+    #     summary['total_time_avg'] = successful['total_time'].mean()
+    #     summary['total_time_min'] = successful['total_time'].min()
+    #     summary['total_time_max'] = successful['total_time'].max()
+    #     summary['total_time_sum'] = successful['total_time'].sum()
+
+    #     print(f"\n=== Summary Statistics ({summary['method']}) ===")
+    #     print(f"Accuracy:       {summary['accuracy']:.2%} ({summary['accuracy_count']})")
+        
+    #     if not USE_IMAGE_PATH:
+    #         print(f"PreProcess Time:     avg={summary['preprocess_time_avg']:.2f}s, min={summary['preprocess_time_min']:.2f}s, max={summary['preprocess_time_max']:.2f}s")
+    #         print(f"Encode Time:     avg={summary['encode_time_avg']:.2f}s, min={summary['encode_time_min']:.2f}s, max={summary['encode_time_max']:.2f}s")
+    #         print(f"Project Time:     avg={summary['project_time_avg']:.2f}s, min={summary['project_time_min']:.2f}s, max={summary['project_time_max']:.2f}s")
+    #         print(f"Prune Time:     avg={summary['prune_time_avg']:.2f}s, min={summary['prune_time_min']:.2f}s, max={summary['prune_time_max']:.2f}s")
+    #         print(f"Tokens:         avg original={summary['token_original_avg']:.1f}, avg pruned={summary['token_pruned_avg']:.1f}")
+        
+    #     print(f"API Call Time:  avg={summary['api_call_time_avg']:.2f}s, min={summary['api_call_time_min']:.2f}s, max={summary['api_call_time_max']:.2f}s")
+    #     print(f"Total Time:     avg={summary['total_time_avg']:.2f}s, min={summary['total_time_min']:.2f}s, max={summary['total_time_max']:.2f}s, sum={summary['total_time_sum']:.2f}s")
+
+    #     # Save summary stats
+    #     summary_df = pd.DataFrame([summary])
+    #     summary_csv_path = f"llava_summary_stats_{method_suffix}.csv"
+    #     summary_df.to_csv(summary_csv_path, index=False)
+    #     print(f"Saved summary statistics to {summary_csv_path}")
+
+    # else:
+    #     print("No successful API responses to compute summary statistics.")
 
 
-
-    #pruned_features = getPrunedVisualToken(model, IMAGE_PATH, TEXTS, keep_ratio=0.125, lambda_val=0.1)
+if __name__ == '__main__':
+    main()
