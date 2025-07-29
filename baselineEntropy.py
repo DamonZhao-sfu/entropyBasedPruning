@@ -12,11 +12,14 @@ import json
 import io
 import base64
 import os
+import csv
+import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
 from datetime import datetime
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 from cdencoder import CLIPVisionTower
+
 vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
 class MockArgs:
     def __init__(self):
@@ -303,26 +306,176 @@ def call_vllm_api(image_embedding=None, image_path=None, question="What's in thi
             raise ValueError("image_embedding must be provided when use_image_path=False")
         return call_vllm_api_with_embeds(image_embedding, question, model, api_url)
 
-def compute_pruning_scores(attention_matrix, lambda_val):
+
+
+def enhanced_dynamic_pruning_adjustment(scores, attention_matrix, base_keep_ratio=0.125):
     """
-    Compute comprehensive scores for each image token, combining attention score and entropy.
+    Enhanced dynamic pruning rate adjustment considering multiple factors.
     
     Args:
-        attention_matrix: [num_text_tokens, num_image_tokens] attention matrix
-        lambda_val: Hyperparameter to balance importance and entropy
+        scores: Comprehensive scores for image tokens
+        attention_matrix: Original attention matrix [num_text_tokens, num_image_tokens]
+        base_keep_ratio: Base proportion of tokens to keep
     
     Returns:
-        scores: Comprehensive score for each image token
+        adjusted_keep_ratio: Adjusted pruning rate
     """
+    # Factor 1: Score distribution entropy (as before)
+    entropy_factor = compute_entropy_factor(scores)
+    
+    # Factor 2: Attention sparsity
+    sparsity_factor = compute_sparsity_factor(attention_matrix)
+    
+    # Factor 3: Score concentration (how peaked are the top scores)
+    concentration_factor = compute_concentration_factor(scores)
+    
+    print(f"Entropy factor: {entropy_factor:.3f}")
+    print(f"Sparsity factor: {sparsity_factor:.3f}")
+    print(f"Concentration factor: {concentration_factor:.3f}")
+    
+    # Combine factors to determine adjustment
+    # Higher values suggest we can prune more aggressively
+    combined_factor = (entropy_factor + sparsity_factor + concentration_factor) / 3
+    
+    if combined_factor < 0.3:
+        adjustment = 1.3  # Keep more tokens
+        reason = "complex attention pattern"
+    elif combined_factor > 0.7:
+        adjustment = 0.7  # Prune more aggressively
+        reason = "simple attention pattern"
+    else:
+        adjustment = 1.0  # Use base ratio
+        reason = "moderate complexity"
+    
+    adjusted_ratio = base_keep_ratio * adjustment
+    adjusted_ratio = np.clip(adjusted_ratio, 0.05, 0.5)
+    
+    print(f"Combined factor: {combined_factor:.3f} -> {reason}")
+    print(f"Adjustment multiplier: {adjustment:.3f}")
+    print(f"Final adjusted ratio: {adjusted_ratio:.3f}")
+    
+    return adjusted_ratio
+
+def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
+    # Add small epsilon for numerical stability
+    eps = 1e-10
+    
+    # Importance score: sum of attention weights for each image token
     I = attention_matrix.sum(dim=0)  # [num_image_tokens]
-    attention_per_image_token = attention_matrix / (attention_matrix.sum(dim=0, keepdim=True) + 1e-10)
-    attention_per_image_token = torch.clamp(attention_per_image_token, min=1e-10)
-    H = - (attention_per_image_token * torch.log(attention_per_image_token)).sum(dim=0)
-    scores = I - lambda_val * H
+    
+    # Normalize attention per image token
+    attention_sum = attention_matrix.sum(dim=0, keepdim=True)
+    attention_per_image_token = attention_matrix / (attention_sum + eps)
+    attention_per_image_token = torch.clamp(attention_per_image_token, min=eps)
+    
+    # Shannon entropy for each image token
+    log_attention = torch.log(attention_per_image_token)
+    H = -(attention_per_image_token * log_attention).sum(dim=0)  # [num_image_tokens]
+    
+    # Mutual information approximation using variance
+    attention_variance = torch.var(attention_per_image_token, dim=0)  # [num_image_tokens]
+    max_variance = attention_variance.max()
+    if max_variance > eps:
+        mi_approx = attention_variance / max_variance  # Normalize
+    else:
+        mi_approx = torch.zeros_like(attention_variance)
+    
+    # Combine scores
+    scores = alpha * I + (1 - alpha) * mi_approx - lambda_val * H
+    
+    # Check for invalid values
+    if torch.isnan(scores).any() or torch.isinf(scores).any():
+        print("Warning: Invalid scores detected in compute_pruning_scores")
+        # Fallback to importance scores only
+        scores = I
+    
     return scores
 
+def adjust_pruning_rate(scores, base_keep_ratio=0.125):
+    """
+    Adjust pruning rate based on average entropy of image tokens.
+    
+    Args:
+        scores: Comprehensive scores for image tokens [num_image_tokens]
+        base_keep_ratio: Base proportion of tokens to keep
+    
+    Returns:
+        adjusted_keep_ratio: Adjusted pruning rate
+    """
+    # Ensure scores are valid and not all the same
+    if torch.isnan(scores).any() or torch.isinf(scores).any():
+        print("Warning: Invalid scores detected, using base keep ratio")
+        return base_keep_ratio
+    
+    # Handle case where all scores are identical
+    if torch.allclose(scores, scores[0]):
+        print("Warning: All scores are identical, using base keep ratio")
+        return base_keep_ratio
+    
+    # Compute softmax probabilities with numerical stability
+    # Subtract max for numerical stability
+    scores_stable = scores - scores.max()
+    probs = F.softmax(scores_stable, dim=0)
+    
+    # Add small epsilon to prevent log(0)
+    eps = 1e-10
+    probs = torch.clamp(probs, min=eps, max=1.0)
+    
+    # Compute entropy: H = -sum(p * log(p))
+    log_probs = torch.log(probs)
+    entropy = -torch.sum(probs * log_probs)
+    
+    # Normalize entropy by maximum possible entropy (log(n))
+    max_entropy = torch.log(torch.tensor(len(scores), dtype=scores.dtype, device=scores.device))
+    normalized_entropy = entropy / max_entropy
+    
+    print(f"Raw entropy: {entropy.item():.4f}")
+    print(f"Max possible entropy: {max_entropy.item():.4f}")
+    print(f"Normalized entropy: {normalized_entropy.item():.4f}")
+    
+    # Adjust keep ratio based on normalized entropy
+    # High entropy (uniform distribution) -> keep more tokens
+    # Low entropy (peaked distribution) -> can prune more aggressively
+    if normalized_entropy < 0.3:  # Very peaked distribution
+        adjusted_ratio = base_keep_ratio * 0.7  # More aggressive pruning
+        print("Low entropy detected - more aggressive pruning")
+    elif normalized_entropy > 0.8:  # More uniform distribution
+        adjusted_ratio = base_keep_ratio * 1.3  # Less aggressive pruning
+        print("High entropy detected - less aggressive pruning")
+    else:  # Medium entropy
+        adjusted_ratio = base_keep_ratio
+        print("Medium entropy - using base pruning rate")
+    
+    # Ensure the ratio stays within reasonable bounds
+    adjusted_ratio = torch.clamp(torch.tensor(adjusted_ratio), min=0.05, max=0.5).item()
+    
+    print(f"Base keep ratio: {base_keep_ratio:.3f}")
+    print(f"Adjusted keep ratio: {adjusted_ratio:.3f}")
+    
+    return adjusted_ratio
 
-def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=0.1):
+# def adjust_pruning_rate(scores, base_keep_ratio=0.125):
+#     """
+#     Adjust pruning rate based on average entropy of image tokens.
+    
+#     Args:
+#         scores: Comprehensive scores for image tokens
+#         base_keep_ratio: Base proportion of tokens to keep
+    
+#     Returns:
+#         adjusted_keep_ratio: Adjusted pruning rate
+#     """
+#     entropy = -torch.sum(F.softmax(scores, dim=0) * torch.log(F.softmax(scores, dim=0) + 1e-10), dim=0)
+#     avg_entropy = entropy.mean().item()
+#     print(avg_entropy)
+#     if avg_entropy < 0.5:
+#         return base_keep_ratio * 0.8  # More aggressive pruning
+#     elif avg_entropy > 1.0:
+#         return base_keep_ratio * 1.2  # Less aggressive pruning
+#     return base_keep_ratio
+
+
+def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.25, lambda_val=0.1, recovery_ratio=0.05):
     # Load and preprocess image
     image = Image.open(image_path)
     inputs = vision_tower.image_processor(image, return_tensors="pt")
@@ -356,7 +509,6 @@ def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=
                 for k, v in text_inputs.items()
             }
             text_embeds = vision_tower.text_tower(**text_inputs).text_embeds
-            print(f"text_embeds shape before reshape: {text_embeds.shape}")
     
             if text_embeds.dim() == 2:
                 text_embeds = text_embeds.unsqueeze(0)  # Add batch dimension if missing
@@ -374,30 +526,18 @@ def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=
     
     # Get projected dimensions
     projected_dim = image_features.shape[-1]  # This should be 4096
-    print(f"Image features shape after projection: {image_features.shape}")
     
     # Compute text-guided attention matrix using text_embeds and image_features
     if texts is not None:
         # Ensure text_embeds and image_features are aligned in dimensionality
         text_embeds = text_embeds.to(device=model_device, dtype=torch.float16)
-        print(f"Text embeds shape: {text_embeds.shape}")
-        print(f"Image features shape: {image_features.shape}")
-        
+
         # Check if dimensions match, if not, we need to project text_embeds
         if text_embeds.shape[-1] != image_features.shape[-1]:
-            print(f"Dimension mismatch: text_embeds {text_embeds.shape[-1]} vs image_features {image_features.shape[-1]}")
-            
-            # Option 1: Project text embeddings to match image feature dimension
-            if hasattr(model, 'multi_modal_projector') and hasattr(model.multi_modal_projector, 'weight'):
-                # Use the same projector as images (might not be ideal but ensures compatibility)
-                text_embeds_projected = F.linear(text_embeds, model.multi_modal_projector.weight, model.multi_modal_projector.bias if hasattr(model.multi_modal_projector, 'bias') else None)
-            else:
-                # Create a simple linear projection
-                projection_layer = torch.nn.Linear(text_embeds.shape[-1], image_features.shape[-1]).to(model_device).half()
-                text_embeds_projected = projection_layer(text_embeds)
-            
-            print(f"Text embeds after projection: {text_embeds_projected.shape}")
-            
+            # Create a simple linear projection
+            projection_layer = torch.nn.Linear(text_embeds.shape[-1], image_features.shape[-1]).to(model_device).half()
+            text_embeds_projected = projection_layer(text_embeds)
+                    
             # Compute similarity using projected text embeddings
             attention_matrix = torch.bmm(text_embeds_projected, image_features.transpose(1, 2))  # [B, num_text_tokens, num_image_tokens]
         else:
@@ -409,7 +549,8 @@ def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=
     
     # Compute pruning scores
     scores = compute_pruning_scores(attention_matrix, lambda_val)
-    
+    #keep_ratio = enhanced_dynamic_pruning_adjustment(scores, attention_matrix,keep_ratio)
+
     # Select top-k tokens
     num_image_tokens = N
     num_tokens_to_keep = min(int(keep_ratio * num_image_tokens), num_image_tokens)
@@ -419,13 +560,192 @@ def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=
     if (top_indices >= num_image_tokens).any() or (top_indices < 0).any():
         raise ValueError(f"top_indices contains invalid values: {top_indices}")
     
-    # Select pruned features
-    image_features_selected = image_features[:, top_indices, :]  # [B, num_tokens_to_keep, C]
-    image_features_selected = image_features_selected.detach().cpu()
+    all_indices = torch.arange(num_image_tokens, device=model_device)
+    pruned_indices = all_indices[~torch.isin(all_indices, top_indices)]
     
+    # Compute summary token for pruned tokens
+    if pruned_indices.numel() > 0:
+        summary_token = image_features[:, pruned_indices, :].mean(dim=1, keepdim=True)  # [B, 1, C]
+         # Optimization: Add summary token for pruned tokens
+        image_features_selected = torch.cat(
+            [image_features[:, top_indices, :], summary_token], dim=1
+        )  # [B, num_tokens_to_keep + 1, C]
+    else:
+        image_features_selected = image_features[:, top_indices, :]  # [B, num_tokens_to_keep, C]
+    
+    # Recover additional tokens based on text relevance
+    num_tokens_to_recover = min(int(recovery_ratio * num_image_tokens), pruned_indices.numel())
+    if num_tokens_to_recover > 0:
+        recovery_scores = attention_matrix.sum(dim=0)[pruned_indices]  # [num_pruned_tokens]
+        _, recovery_indices = torch.topk(recovery_scores, num_tokens_to_recover, dim=-1)
+        recovery_indices = pruned_indices[recovery_indices]  # Map back to original indices
+        print(f"Recovered indices shape: {recovery_indices.shape}, values: {recovery_indices}")
+        image_features_recovered = image_features[:, recovery_indices, :]  # [B, num_tokens_to_recover, C]
+        image_features_selected = torch.cat(
+            [image_features_selected, image_features_recovered], dim=1
+        )  # [B, num_tokens_to_keep + 1 + num_tokens_to_recover, C]
+    
+    image_features_selected = image_features_selected.detach().cpu()
     print(f"Final output shape: {image_features_selected.shape}")
+
+    # # Select pruned features
+    # image_features_selected = image_features[:, top_indices, :]  # [B, num_tokens_to_keep, C]
+    # image_features_selected = image_features_selected.detach().cpu()
+    
+    # print(f"Selected image features shape: {image_features_selected.shape}")
+    # print(f"Final number of tokens: {image_features_selected.shape[1]}")
+    # print(f"Feature dimension: {image_features_selected.shape[2]}")
+    # print(f"Memory size: {image_features_selected.element_size() * image_features_selected.nelement() / (1024**2):.2f} MB")
+    # print("-" * 50)
+    
     return image_features_selected
 
+def save_results_to_csv(results_data, filename="tpcds_query_times.csv"):
+    """
+    Save query results data to CSV file with correct headers
+    
+    Args:
+        results_data: List of dictionaries containing query execution data
+        filename: Output CSV filename
+    """
+    if not results_data:
+        print("No results data to save")
+        return
+    
+    # Define CSV headers that match the query data structure from parse_query_file()
+    headers = [
+        'test_number',
+        'total_tests', 
+        'sample_image_path',
+        'timestamp',
+        'embed_time',
+        'api_call_time',
+        'total_time',
+        'api_success',
+        'generated_text',
+        'predicted_answer',
+        'is_correct',
+        'error_message',
+        'full_response',
+        'model_path',
+        'original_token',
+        'pruned_token',
+        'api_url',
+        'method',
+        'preprocess_time',
+        'encode_time',
+        'project_time',
+        'prune_time'
+    ]
+    
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=headers, extrasaction='ignore')
+            writer.writeheader()
+            
+            for row in results_data:
+                # Fill missing fields with empty strings
+                complete_row = {header: row.get(header, '') for header in headers}
+                writer.writerow(complete_row)
+        
+        print(f"Results saved to {filename}")
+        print(f"Number of records saved: {len(results_data)}")
+        
+        # Verify file was created and has content
+        import os
+        if os.path.exists(filename):
+            file_size = os.path.getsize(filename)
+            print(f"File size: {file_size} bytes")
+        
+    except Exception as e:
+        print(f"Error saving to CSV: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def generate_timing_summary(results_data):
+    """
+    Generate and display timing summary statistics
+    
+    Args:
+        results_data: List of dictionaries containing result data
+    """
+    if not results_data:
+        print("No results data to summarize")
+        return
+    
+    # Filter successful API calls
+    successful_results = [r for r in results_data if r['api_success']]
+    
+    if not successful_results:
+        print("No successful API calls to summarize")
+        return
+    
+    # Convert to pandas DataFrame for easier analysis
+    df = pd.DataFrame(successful_results)
+    
+    print("\n" + "="*60)
+    print("TIMING SUMMARY REPORT")
+    print("="*60)
+    
+    print(f"Total Tests: {len(results_data)}")
+    print(f"Successful API Calls: {len(successful_results)}")
+    print(f"Success Rate: {len(successful_results)/len(results_data)*100:.1f}%")
+    
+    # Calculate timing statistics
+    timing_stats = {}
+    time_columns = ['embed_time', 'api_call_time', 'total_time']
+    
+    for col in time_columns:
+        if col in df.columns:
+            timing_stats[col] = {
+                'total': df[col].sum(),
+                'average': df[col].mean(),
+                'min': df[col].min(),
+                'max': df[col].max(),
+                'std': df[col].std()
+            }
+    
+    print("\n" + "-"*40)
+    print("TIMING STATISTICS (seconds)")
+    print("-"*40)
+    
+    for time_type, stats in timing_stats.items():
+        print(f"\n{time_type.replace('_', ' ').title()}:")
+        print(f"  Total:   {stats['total']:8.2f}s")
+        print(f"  Average: {stats['average']:8.2f}s")
+        print(f"  Min:     {stats['min']:8.2f}s")
+        print(f"  Max:     {stats['max']:8.2f}s")
+        print(f"  Std Dev: {stats['std']:8.2f}s")
+    
+    # Token statistics
+    if 'original_tokens' in df.columns and 'reduced_tokens' in df.columns:
+        print("\n" + "-"*40)
+        print("TOKEN STATISTICS")
+        print("-"*40)
+        
+        orig_tokens = df['original_tokens'].iloc[0] if len(df) > 0 else 0
+        avg_reduced = df['reduced_tokens'].mean() if 'reduced_tokens' in df.columns else 0
+        reduction_ratio = (orig_tokens - avg_reduced) / orig_tokens * 100 if orig_tokens > 0 else 0
+        
+        print(f"Original Tokens:     {orig_tokens}")
+        print(f"Average Reduced:     {avg_reduced:.1f}")
+        print(f"Reduction Ratio:     {reduction_ratio:.1f}%")
+    
+    # Accuracy statistics
+    if 'is_correct' in df.columns:
+        correct_predictions = df['is_correct'].sum()
+        total_predictions = len([r for r in successful_results if r['predicted_answer']])
+        accuracy = correct_predictions / total_predictions * 100 if total_predictions > 0 else 0
+        
+        print("\n" + "-"*40)
+        print("ACCURACY STATISTICS")
+        print("-"*40)
+        print(f"Correct Predictions: {correct_predictions}")
+        print(f"Total Predictions:   {total_predictions}")
+        print(f"Accuracy:           {accuracy:.1f}%")
+    
+    print("\n" + "="*60)
 
 if __name__ == "__main__":
     MODEL_PATH = "/data/models/llava-1.5-7b-hf"
@@ -468,7 +788,7 @@ if __name__ == "__main__":
         col("B"), 
         col("C"),
         col("D"),
-    ).collect()
+    ).limit(1000).collect()
     
     print(f"Testing {len(sample_data)} questions...")
     print("-" * 60)
@@ -523,7 +843,7 @@ if __name__ == "__main__":
 
                 embed_time = prune_time_end - prune_time_begin
                 result_record['original_token'] = 576
-                result_record['pruned_token'] = 0
+                result_record['pruned_token'] = reduced_tokens.shape[1]
                 result_record['preprocess_time'] = 0
                 result_record['encode_time'] = 0
                 result_record['project_time'] = 0
@@ -596,6 +916,13 @@ if __name__ == "__main__":
         results_data.append(result_record)
         print()
 
+
+    # Save results to CSV
+    csv_filename = f"api_timing_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    save_results_to_csv(results_data, csv_filename)
+    
+    # Generate and display timing summary
+    generate_timing_summary(results_data)
      # Calculate accuracy
     successful_tests = [r for r in results_data if r['api_success'] and r['predicted_answer']]
     if successful_tests:
