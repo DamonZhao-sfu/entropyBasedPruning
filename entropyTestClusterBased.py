@@ -307,148 +307,34 @@ def call_vllm_api(image_embedding=None, image_path=None, question="What's in thi
         return call_vllm_api_with_embeds(image_embedding, question, model, api_url)
 
 
-
-def enhanced_dynamic_pruning_adjustment(scores, attention_matrix, base_keep_ratio=0.125):
+def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
     """
-    Enhanced dynamic pruning rate adjustment considering multiple factors.
+    Compute pruning scores with mutual information approximation.
     
     Args:
-        scores: Comprehensive scores for image tokens
-        attention_matrix: Original attention matrix [num_text_tokens, num_image_tokens]
-        base_keep_ratio: Base proportion of tokens to keep
+        attention_matrix: [num_text_tokens, num_image_tokens] attention matrix
+        lambda_val: Hyperparameter for entropy weight
+        alpha: Weight for mutual information term
     
     Returns:
-        adjusted_keep_ratio: Adjusted pruning rate
+        scores: Comprehensive score for each image token
     """
-    # Factor 1: Score distribution entropy (as before)
-    entropy_factor = compute_entropy_factor(scores)
+    I = attention_matrix.sum(dim=0)  # Importance score [num_image_tokens]
+    attention_per_image_token = attention_matrix / (attention_matrix.sum(dim=0, keepdim=True) + 1e-10)
+    attention_per_image_token = torch.clamp(attention_per_image_token, min=1e-10)
+    H = - (attention_per_image_token * torch.log(attention_per_image_token)).sum(dim=0)  # Entropy
     
-    # Factor 2: Attention sparsity
-    sparsity_factor = compute_sparsity_factor(attention_matrix)
-    
-    # Factor 3: Score concentration (how peaked are the top scores)
-    concentration_factor = compute_concentration_factor(scores)
-    
-    print(f"Entropy factor: {entropy_factor:.3f}")
-    print(f"Sparsity factor: {sparsity_factor:.3f}")
-    print(f"Concentration factor: {concentration_factor:.3f}")
-    
-    # Combine factors to determine adjustment
-    # Higher values suggest we can prune more aggressively
-    combined_factor = (entropy_factor + sparsity_factor + concentration_factor) / 3
-    
-    if combined_factor < 0.3:
-        adjustment = 1.3  # Keep more tokens
-        reason = "complex attention pattern"
-    elif combined_factor > 0.7:
-        adjustment = 0.7  # Prune more aggressively
-        reason = "simple attention pattern"
-    else:
-        adjustment = 1.0  # Use base ratio
-        reason = "moderate complexity"
-    
-    adjusted_ratio = base_keep_ratio * adjustment
-    adjusted_ratio = np.clip(adjusted_ratio, 0.05, 0.5)
-    
-    print(f"Combined factor: {combined_factor:.3f} -> {reason}")
-    print(f"Adjustment multiplier: {adjustment:.3f}")
-    print(f"Final adjusted ratio: {adjusted_ratio:.3f}")
-    
-    return adjusted_ratio
-
-
-def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
-    eps = 1e-10
-    
-    I = attention_matrix.sum(dim=0)
-    
-    attention_sum = attention_matrix.sum(dim=0, keepdim=True)
-    attention_per_image_token = attention_matrix / (attention_sum + eps)
-    attention_per_image_token = torch.clamp(attention_per_image_token, min=eps)
-    
-    log_attention = torch.log(attention_per_image_token)
-    H = -(attention_per_image_token * log_attention).sum(dim=0)
-    
-    attention_variance = torch.var(attention_per_image_token, dim=0)
-    max_variance = attention_variance.max()
-    if max_variance > eps:
-        mi_approx = attention_variance / max_variance
-    else:
-        mi_approx = torch.zeros_like(attention_variance)
+    # Approximate mutual information: higher variance in attention indicates higher unique contribution
+    attention_variance = torch.var(attention_per_image_token, dim=0)  # [num_image_tokens]
+    mi_approx = attention_variance / (attention_variance.max() + 1e-10)  # Normalize
     
     scores = alpha * I + (1 - alpha) * mi_approx - lambda_val * H
-    
-    if torch.isnan(scores).any() or torch.isinf(scores).any():
-        print("Warning: Invalid scores detected in compute_pruning_scores")
-        scores = I
-    
     return scores
 
-def adjust_pruning_rate(scores, base_keep_ratio=0.125):
-    """
-    Adjust pruning rate based on average entropy of image tokens.
-    
-    Args:
-        scores: Comprehensive scores for image tokens [num_image_tokens]
-        base_keep_ratio: Base proportion of tokens to keep
-    
-    Returns:
-        adjusted_keep_ratio: Adjusted pruning rate
-    """
-    # Ensure scores are valid and not all the same
-    if torch.isnan(scores).any() or torch.isinf(scores).any():
-        print("Warning: Invalid scores detected, using base keep ratio")
-        return base_keep_ratio
-    
-    # Handle case where all scores are identical
-    if torch.allclose(scores, scores[0]):
-        print("Warning: All scores are identical, using base keep ratio")
-        return base_keep_ratio
-    
-    # Compute softmax probabilities with numerical stability
-    # Subtract max for numerical stability
-    scores_stable = scores - scores.max()
-    probs = F.softmax(scores_stable, dim=0)
-    
-    # Add small epsilon to prevent log(0)
-    eps = 1e-10
-    probs = torch.clamp(probs, min=eps, max=1.0)
-    
-    # Compute entropy: H = -sum(p * log(p))
-    log_probs = torch.log(probs)
-    entropy = -torch.sum(probs * log_probs)
-    
-    # Normalize entropy by maximum possible entropy (log(n))
-    max_entropy = torch.log(torch.tensor(len(scores), dtype=scores.dtype, device=scores.device))
-    normalized_entropy = entropy / max_entropy
-    
-    print(f"Raw entropy: {entropy.item():.4f}")
-    print(f"Max possible entropy: {max_entropy.item():.4f}")
-    print(f"Normalized entropy: {normalized_entropy.item():.4f}")
-    
-    # Adjust keep ratio based on normalized entropy
-    # High entropy (uniform distribution) -> keep more tokens
-    # Low entropy (peaked distribution) -> can prune more aggressively
-    if normalized_entropy < 0.3:  # Very peaked distribution
-        adjusted_ratio = base_keep_ratio * 0.7  # More aggressive pruning
-        print("Low entropy detected - more aggressive pruning")
-    elif normalized_entropy > 0.8:  # More uniform distribution
-        adjusted_ratio = base_keep_ratio * 1.3  # Less aggressive pruning
-        print("High entropy detected - less aggressive pruning")
-    else:  # Medium entropy
-        adjusted_ratio = base_keep_ratio
-        print("Medium entropy - using base pruning rate")
-    
-    # Ensure the ratio stays within reasonable bounds
-    adjusted_ratio = torch.clamp(torch.tensor(adjusted_ratio), min=0.05, max=0.5).item()
-    
-    print(f"Base keep ratio: {base_keep_ratio:.3f}")
-    print(f"Adjusted keep ratio: {adjusted_ratio:.3f}")
-    
-    return adjusted_ratio
 
-
-def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.25, lambda_val=0.1, recovery_ratio=0.05):
+from sklearn.cluster import KMeans
+from sklearn.impute import SimpleImputer
+def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.125, lambda_val=0.1, num_clusters=4):
     # Load and preprocess image
     image = Image.open(image_path)
     inputs = vision_tower.image_processor(image, return_tensors="pt")
@@ -517,49 +403,46 @@ def getPrunedVisualToken(model, image_path, texts, keep_ratio=0.25, lambda_val=0
             # Dimensions already match
             attention_matrix = torch.bmm(text_embeds, image_features.transpose(1, 2))  # [B, num_text_tokens, num_image_tokens]
         
-        attention_matrix = F.softmax(attention_matrix, dim=-1)  
-        attention_matrix = attention_matrix.mean(dim=0)  
+        attention_matrix = F.softmax(attention_matrix, dim=-1)  # Normalize over image tokens
+        attention_matrix = attention_matrix.mean(dim=0)  # Average over batch: [num_text_tokens, num_image_tokens]
     
     # Compute pruning scores
     scores = compute_pruning_scores(attention_matrix, lambda_val)
+    
+    # # Optimization: Cluster-based token selection
+    attention_per_image = attention_matrix / (attention_matrix.sum(dim=0, keepdim=True) + 1e-10)
+    kmeans = KMeans(n_clusters=num_clusters, random_state=0)
+    # cluster_labels = torch.tensor(kmeans.fit_predict(attention_per_image.t().detach().cpu().numpy()), device=model_device)
+    
+    attention_data = attention_per_image.t().detach().cpu().numpy()
+    
+    # Apply SimpleImputer to handle NaN values
+    imputer = SimpleImputer(strategy='mean')  # You can also use 'median' or 'constant'
+    attention_data_imputed = imputer.fit_transform(attention_data)
+    
+    # Convert back to tensor and move to model device
+    cluster_labels = torch.tensor(kmeans.fit_predict(attention_data_imputed), device=model_device)
 
-    # Select top-k tokens
     num_image_tokens = N
     num_tokens_to_keep = min(int(keep_ratio * num_image_tokens), num_image_tokens)
-    _, top_indices = torch.topk(scores, num_tokens_to_keep, dim=-1)
+    top_indices = []
+    tokens_per_cluster = max(1, num_tokens_to_keep // num_clusters)
     
-    # Validate indices
+    for cluster_id in range(num_clusters):
+        cluster_mask = cluster_labels == cluster_id
+        cluster_scores = scores[cluster_mask]
+        cluster_indices = torch.arange(num_image_tokens, device=model_device)[cluster_mask]
+        if cluster_scores.numel() > 0:
+            _, top_cluster_indices = torch.topk(cluster_scores, min(tokens_per_cluster, cluster_scores.numel()), dim=-1)
+            top_indices.append(cluster_indices[top_cluster_indices])
+    
+    top_indices = torch.cat(top_indices)[:num_tokens_to_keep]  # Ensure exact number of tokens
     if (top_indices >= num_image_tokens).any() or (top_indices < 0).any():
         raise ValueError(f"top_indices contains invalid values: {top_indices}")
     
-    all_indices = torch.arange(num_image_tokens, device=model_device)
-    pruned_indices = all_indices[~torch.isin(all_indices, top_indices)]
-    
-    # Compute summary token for pruned tokens
-    if pruned_indices.numel() > 0:
-        summary_token = image_features[:, pruned_indices, :].mean(dim=1, keepdim=True)  # [B, 1, C]
-         # Optimization: Add summary token for pruned tokens
-        image_features_selected = torch.cat(
-            [image_features[:, top_indices, :], summary_token], dim=1
-        )  # [B, num_tokens_to_keep + 1, C]
-    else:
-        image_features_selected = image_features[:, top_indices, :]  # [B, num_tokens_to_keep, C]
-    
-    # Recover additional tokens based on text relevance
-    num_tokens_to_recover = min(int(recovery_ratio * num_image_tokens), pruned_indices.numel())
-    if num_tokens_to_recover > 0:
-        recovery_scores = attention_matrix.sum(dim=0)[pruned_indices]  # [num_pruned_tokens]
-        _, recovery_indices = torch.topk(recovery_scores, num_tokens_to_recover, dim=-1)
-        recovery_indices = pruned_indices[recovery_indices]  # Map back to original indices
-        print(f"Recovered indices shape: {recovery_indices.shape}, values: {recovery_indices}")
-        image_features_recovered = image_features[:, recovery_indices, :]  # [B, num_tokens_to_recover, C]
-        image_features_selected = torch.cat(
-            [image_features_selected, image_features_recovered], dim=1
-        )  # [B, num_tokens_to_keep + 1 + num_tokens_to_recover, C]
-    
+    image_features_selected = image_features[:, top_indices, :]  # [B, num_tokens_to_keep, C]
     image_features_selected = image_features_selected.detach().cpu()
     print(f"Final output shape: {image_features_selected.shape}")
-    
     return image_features_selected
 
 def save_results_to_csv(results_data, filename="tpcds_query_times.csv"):
