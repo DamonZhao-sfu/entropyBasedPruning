@@ -307,56 +307,6 @@ def call_vllm_api(image_embedding=None, image_path=None, question="What's in thi
         return call_vllm_api_with_embeds(image_embedding, question, model, api_url)
 
 
-
-def enhanced_dynamic_pruning_adjustment(scores, attention_matrix, base_keep_ratio=0.125):
-    """
-    Enhanced dynamic pruning rate adjustment considering multiple factors.
-    
-    Args:
-        scores: Comprehensive scores for image tokens
-        attention_matrix: Original attention matrix [num_text_tokens, num_image_tokens]
-        base_keep_ratio: Base proportion of tokens to keep
-    
-    Returns:
-        adjusted_keep_ratio: Adjusted pruning rate
-    """
-    # Factor 1: Score distribution entropy (as before)
-    entropy_factor = compute_entropy_factor(scores)
-    
-    # Factor 2: Attention sparsity
-    sparsity_factor = compute_sparsity_factor(attention_matrix)
-    
-    # Factor 3: Score concentration (how peaked are the top scores)
-    concentration_factor = compute_concentration_factor(scores)
-    
-    print(f"Entropy factor: {entropy_factor:.3f}")
-    print(f"Sparsity factor: {sparsity_factor:.3f}")
-    print(f"Concentration factor: {concentration_factor:.3f}")
-    
-    # Combine factors to determine adjustment
-    # Higher values suggest we can prune more aggressively
-    combined_factor = (entropy_factor + sparsity_factor + concentration_factor) / 3
-    
-    if combined_factor < 0.3:
-        adjustment = 1.3  # Keep more tokens
-        reason = "complex attention pattern"
-    elif combined_factor > 0.7:
-        adjustment = 0.7  # Prune more aggressively
-        reason = "simple attention pattern"
-    else:
-        adjustment = 1.0  # Use base ratio
-        reason = "moderate complexity"
-    
-    adjusted_ratio = base_keep_ratio * adjustment
-    adjusted_ratio = np.clip(adjusted_ratio, 0.05, 0.5)
-    
-    print(f"Combined factor: {combined_factor:.3f} -> {reason}")
-    print(f"Adjustment multiplier: {adjustment:.3f}")
-    print(f"Final adjusted ratio: {adjusted_ratio:.3f}")
-    
-    return adjusted_ratio
-
-
 def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
     eps = 1e-10
     
@@ -376,8 +326,10 @@ def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
     else:
         mi_approx = torch.zeros_like(attention_variance)
     
-    scores = alpha * I + (1 - alpha) * mi_approx - lambda_val * H
-    
+    #scores = alpha * I + (1 - alpha) * mi_approx - lambda_val * H
+    #entropy only score
+    scores = - lambda_val * H
+
     if torch.isnan(scores).any() or torch.isinf(scores).any():
         print("Warning: Invalid scores detected in compute_pruning_scores")
         scores = I
