@@ -708,11 +708,335 @@ def generate_timing_summary(results_data):
     
     print("\n" + "="*60)
 
+
+
+def getPrunedVisualTokenVisPruner_optimized(model, image_path, texts, keep_ratio=0.125, 
+                                          important_ratio=0.6, recovery_ratio=0.1):
+    """
+    Highly optimized version of VisPruner with multiple speedup techniques:
+    1. Minimized GPU-CPU transfers
+    2. In-place operations where possible  
+    3. Vectorized operations
+    4. Memory-efficient tensor operations
+    5. Early termination optimizations
+    6. Approximate similarity computation for large token sets
+    """
+    
+    # Convert binary data to PIL Image
+    image = Image.open(image_path)
+    inputs = vision_tower.image_processor(image, return_tensors="pt")
+    images = inputs["pixel_values"]
+    
+    model_device = vision_tower.device
+    dtype = vision_tower.dtype
+    
+    # Process image features and get attention from visual encoder
+    with torch.no_grad():
+        image_forward_outs = vision_tower.vision_tower(
+            images.to(device=model_device, dtype=dtype),
+            output_hidden_states=True,
+            output_attentions=True
+        )
+        
+        # Extract [CLS] attention more efficiently
+        attentions = image_forward_outs.attentions
+        if len(attentions) > 1:
+            # Use penultimate layer, average across heads in one operation
+            cls_attention = attentions[-2].squeeze(0).mean(dim=0)[0, 1:]  # [num_patches]
+        else:
+            cls_attention = attentions[-1].squeeze(0).mean(dim=0)[0, 1:]
+        
+        image_outputs = vision_tower.feature_select(image_forward_outs)
+        image_features = image_outputs.to(dtype)  # Keep on GPU
+    
+    B, N, C = image_features.shape
+    
+    # Ensure consistent dtypes - convert image_features to float16 and projector to same device/dtype
+    image_features = image_features.to(device=model_device, dtype=torch.float16)
+    model.multi_modal_projector = model.multi_modal_projector.to(device=model_device, dtype=torch.float16)
+    
+    # Pre-calculate token counts to avoid repeated calculations
+    num_tokens_to_keep = min(int(keep_ratio * N), N)
+    num_important_tokens = int(num_tokens_to_keep * important_ratio)
+    num_diverse_tokens = num_tokens_to_keep - num_important_tokens
+    
+    # Early exit if keeping all tokens
+    if num_tokens_to_keep >= N:
+        image_features = model.multi_modal_projector(image_features)
+        return image_features.detach().cpu()
+    
+    # Step 1: Select important tokens (vectorized topk)
+    _, important_indices = torch.topk(cls_attention, num_important_tokens, dim=-1)
+    
+    # Create boolean mask for remaining indices (more memory efficient)
+    all_mask = torch.ones(N, dtype=torch.bool, device=model_device)
+    all_mask[important_indices] = False
+    remaining_indices = torch.nonzero(all_mask, as_tuple=True)[0]
+    
+    # Step 2: Optimized diverse token selection
+    diverse_indices = torch.empty(0, dtype=torch.long, device=model_device)
+    
+    if num_diverse_tokens > 0 and len(remaining_indices) > 0:
+        if len(remaining_indices) <= num_diverse_tokens:
+            # If we need all remaining, skip similarity computation
+            diverse_indices = remaining_indices
+        else:
+            # Apply multimodal projection early to remaining tokens only
+            image_features = model.multi_modal_projector.to(model_device)(image_features)
+            
+            # Use approximate similarity for large token sets (>500 tokens)
+            if len(remaining_indices) > 500:
+                # Random sampling for approximation - much faster
+                sample_size = min(num_diverse_tokens * 4, len(remaining_indices))
+                sampled_idx = torch.randperm(len(remaining_indices), device=model_device)[:sample_size]
+                sampled_indices = remaining_indices[sampled_idx]
+                
+                remaining_features = image_features[0, sampled_indices, :]
+                remaining_features = F.normalize(remaining_features, p=2, dim=-1)
+                
+                diverse_idx = similarity_based_duplicate_removal_fast(
+                    remaining_features, min(num_diverse_tokens, len(sampled_indices))
+                )
+                diverse_indices = sampled_indices[diverse_idx]
+            else:
+                # Full similarity computation for smaller sets
+                remaining_features = image_features[0, remaining_indices, :]
+                remaining_features = F.normalize(remaining_features, p=2, dim=-1)
+                
+                diverse_idx = similarity_based_duplicate_removal_fast(
+                    remaining_features, num_diverse_tokens
+                )
+                diverse_indices = remaining_indices[diverse_idx]
+    else:
+        # Apply projection to all features if not done yet
+        image_features = model.multi_modal_projector.to(model_device)(image_features)
+    
+    # Combine and sort indices in one operation
+    selected_indices = torch.cat([important_indices, diverse_indices])
+    selected_indices = torch.sort(selected_indices)[0]
+    
+    # Extract selected features
+    image_features_selected = image_features[:, selected_indices, :]
+    
+    # Step 3: Optimized text-based recovery
+    if texts is not None and recovery_ratio > 0:
+        # Process text more efficiently
+        text_embeds = process_text_efficiently(texts, vision_tower, model_device)
+        
+        if text_embeds is not None:
+            # Get pruned indices using boolean indexing
+            selected_mask = torch.zeros(N, dtype=torch.bool, device=model_device)
+            selected_mask[selected_indices] = True
+            pruned_indices = torch.nonzero(~selected_mask, as_tuple=True)[0]
+            
+            if len(pruned_indices) > 0:
+                num_tokens_to_recover = min(int(recovery_ratio * N), len(pruned_indices))
+                
+                if num_tokens_to_recover > 0:
+                    # Efficient attention computation
+                    if text_embeds.shape[-1] != image_features.shape[-1]:
+                        # Use smaller projection layer
+                        projection_layer = torch.nn.Linear(
+                            text_embeds.shape[-1], image_features.shape[-1],
+                            bias=False  # Remove bias for speed
+                        ).to(model_device, dtype=torch.float16)
+                        text_embeds = projection_layer(text_embeds)
+                    
+                    # Compute attention only for pruned tokens (memory efficient)
+                    pruned_features = image_features[:, pruned_indices, :]
+                    attention_scores = torch.einsum('btc,bpc->btp', text_embeds, pruned_features)
+                    attention_scores = F.softmax(attention_scores, dim=-1).mean(dim=(0, 1))
+                    
+                    # Recover tokens
+                    _, recovery_idx = torch.topk(attention_scores, num_tokens_to_recover)
+                    recovery_indices = pruned_indices[recovery_idx]
+                    
+                    # Concatenate efficiently
+                    image_features_recovered = image_features[:, recovery_indices, :]
+                    image_features_selected = torch.cat(
+                        [image_features_selected, image_features_recovered], dim=1
+                    )
+    
+    # Single GPU-CPU transfer at the end
+    result = image_features_selected.detach().cpu()
+    
+    print(f"Final output shape: {result.shape}")
+    print(f"Kept {result.shape[1]} out of {N} tokens ({result.shape[1]/N*100:.1f}%)")
+    
+    return result
+
+
+def similarity_based_duplicate_removal_fast(features, num_to_keep):
+    """
+    Optimized similarity-based token selection with approximate methods for speed.
+    """
+    n_tokens, dim = features.shape
+    
+    if n_tokens <= num_to_keep:
+        return torch.arange(n_tokens, device=features.device)
+    
+    # For very large token sets, use clustering-based approximation
+    if n_tokens > 1000:
+        return cluster_based_selection(features, num_to_keep)
+    
+    # For medium-sized sets, use optimized greedy selection
+    selected_idx = []
+    selected_idx.append(0)  # Start with first token
+    
+    remaining_mask = torch.ones(n_tokens, dtype=torch.bool, device=features.device)
+    remaining_mask[0] = False
+    
+    # Precompute all pairwise similarities (batch operation)
+    similarity_matrix = torch.mm(features, features.t())
+    
+    for _ in range(num_to_keep - 1):
+        remaining_indices = torch.nonzero(remaining_mask, as_tuple=True)[0]
+        if len(remaining_indices) == 0:
+            break
+        
+        # Find token with minimum maximum similarity to selected tokens
+        selected_similarities = similarity_matrix[remaining_indices][:, selected_idx]
+        max_similarities = selected_similarities.max(dim=1)[0]
+        min_idx = max_similarities.argmin()
+        
+        next_token_idx = remaining_indices[min_idx].item()
+        selected_idx.append(next_token_idx)
+        remaining_mask[next_token_idx] = False
+    
+    return torch.tensor(selected_idx, device=features.device)
+
+
+def cluster_based_selection(features, num_to_keep):
+    """
+    Fast approximate selection using k-means clustering.
+    """
+    from sklearn.cluster import MiniBatchKMeans
+    import numpy as np
+    
+    # Convert to numpy for sklearn
+    features_np = features.detach().cpu().numpy()
+    
+    # Use more clusters than needed, then select representatives
+    n_clusters = min(num_to_keep * 2, len(features_np))
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=100)
+    cluster_labels = kmeans.fit_predict(features_np)
+    
+    # Select one representative per cluster, prioritizing diverse clusters
+    selected_idx = []
+    cluster_centers = kmeans.cluster_centers_
+    
+    # Calculate inter-cluster distances
+    cluster_distances = np.linalg.norm(
+        cluster_centers[:, np.newaxis] - cluster_centers[np.newaxis, :], axis=2
+    )
+    
+    # Greedy selection of diverse clusters
+    selected_clusters = []
+    remaining_clusters = list(range(n_clusters))
+    
+    # Start with cluster closest to mean
+    mean_features = features_np.mean(axis=0)
+    distances_to_mean = np.linalg.norm(cluster_centers - mean_features, axis=1)
+    first_cluster = distances_to_mean.argmin()
+    selected_clusters.append(first_cluster)
+    remaining_clusters.remove(first_cluster)
+    
+    while len(selected_clusters) < num_to_keep and remaining_clusters:
+        # Find cluster most distant from selected ones
+        min_distances = []
+        for cluster in remaining_clusters:
+            min_dist = min(cluster_distances[cluster][selected] for selected in selected_clusters)
+            min_distances.append(min_dist)
+        
+        next_cluster = remaining_clusters[np.argmax(min_distances)]
+        selected_clusters.append(next_cluster)
+        remaining_clusters.remove(next_cluster)
+    
+    # Select one representative token from each selected cluster
+    for cluster_id in selected_clusters:
+        cluster_tokens = np.where(cluster_labels == cluster_id)[0]
+        if len(cluster_tokens) > 0:
+            # Select token closest to cluster center
+            cluster_features = features_np[cluster_tokens]
+            distances = np.linalg.norm(cluster_features - cluster_centers[cluster_id], axis=1)
+            representative = cluster_tokens[distances.argmin()]
+            selected_idx.append(representative)
+    
+    return torch.tensor(selected_idx[:num_to_keep], device=features.device)
+
+
+def process_text_efficiently(texts, vision_tower, model_device):
+    """
+    Optimized text processing with minimal memory allocation.
+    """
+    try:
+        with torch.no_grad():
+            text_inputs = vision_tower.text_tokenizer(text=texts, return_tensors="pt")
+            
+            # More efficient padding computation
+            input_length = text_inputs.input_ids.shape[1]
+            max_pos = vision_tower.max_position_embeddings
+            
+            if input_length <= max_pos:
+                # No segmentation needed
+                padding_needed = max_pos - input_length
+                if padding_needed > 0:
+                    pad_tensor = torch.zeros((1, padding_needed), dtype=text_inputs.input_ids.dtype)
+                    text_inputs = {
+                        k: torch.cat([v, pad_tensor], dim=1).to(model_device)
+                        for k, v in text_inputs.items()
+                    }
+                else:
+                    text_inputs = {k: v.to(model_device) for k, v in text_inputs.items()}
+            else:
+                # Efficient segmentation
+                text_segment = (input_length - 1) // max_pos + 1
+                total_length = max_pos * text_segment
+                padding_needed = total_length - input_length
+                
+                text_inputs = {
+                    k: torch.cat([v, v.new_zeros((v.shape[0], padding_needed))], dim=1)
+                    .reshape(-1, max_pos).to(model_device)
+                    for k, v in text_inputs.items()
+                }
+            
+            text_embeds = vision_tower.text_tower(**text_inputs).text_embeds
+            
+            # Efficient reshaping
+            if text_embeds.dim() == 2:
+                text_embeds = text_embeds.unsqueeze(0)
+            elif text_embeds.dim() > 3:
+                batch_size = 1
+                seq_len = text_embeds.numel() // (batch_size * text_embeds.size(-1))
+                text_embeds = text_embeds.view(batch_size, seq_len, -1)
+            
+            return text_embeds.to(torch.float16)
+            
+    except Exception as e:
+        print(f"Text processing failed: {e}")
+        return None
+
+
 if __name__ == "__main__":
     MODEL_PATH = "/data/models/llava-1.5-7b-hf"
     IMAGE_PATH = "/home/haikai/MMbench/extracted_images/0.jpg"
     TEXTS = "Describe the main object in the image"
     API_URL = "http://localhost:8005"
+
+    PRUNING_CONFIGS = [
+        {'keep_ratio': 0.05, 'recovery_ratio': 0.05},
+        {'keep_ratio': 0.05, 'recovery_ratio': 0.1},
+        {'keep_ratio': 0.05, 'recovery_ratio': 0.2},
+        {'keep_ratio': 0.1, 'recovery_ratio': 0.05},
+        {'keep_ratio': 0.1, 'recovery_ratio': 0.1},
+        {'keep_ratio': 0.1, 'recovery_ratio': 0.2},
+        {'keep_ratio': 0.25, 'recovery_ratio': 0.05},
+        {'keep_ratio': 0.25, 'recovery_ratio': 0.1},
+        {'keep_ratio': 0.25, 'recovery_ratio': 0.2},
+        {'keep_ratio': 0.5, 'recovery_ratio': 0.05},
+        {'keep_ratio': 0.5, 'recovery_ratio': 0.1},
+        {'keep_ratio': 0.5, 'recovery_ratio': 0.2},
+    ]
 
     model = LlavaForConditionalGeneration.from_pretrained(
         MODEL_PATH, 
@@ -723,8 +1047,6 @@ if __name__ == "__main__":
 
     processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
     print("Comparing different token pruning methods...")    
-    # Initialize results storage
-    results_data = []
     
     # Get sample images for testing
     spark = SparkSession.builder.appName("AudioVisualQAProcessor") \
@@ -749,67 +1071,86 @@ if __name__ == "__main__":
         col("B"), 
         col("C"),
         col("D"),
-    ).limit(1000).collect()
+    ).collect()
     
-    print(f"Testing {len(sample_data)} questions...")
-    print("-" * 60)
+    print(f"Testing {len(sample_data)} questions with {len(PRUNING_CONFIGS)} configurations...")
+    print(f"Total evaluations: {len(sample_data) * len(PRUNING_CONFIGS)}")
+    print("-" * 80)
 
-    # Run tests with CSV logging
-    for i, row in enumerate(sample_data, 1):
-        question = row['question']  if row['question'] else ""
-        hint = row['hint'] if row['hint'] else ""
-        correct_answer = row['answer']  if row['answer']  else ""
-        option_a = row['A'] if row['A'] else ""
-        option_b = row['B'] if row['B'] else ""
-        option_c = row['C'] if row['C'] else ""
-        option_d = row['D'] if row['D'] else ""
-        image_path = "/home/haikai/MMbench/extracted_images/" + str(i-1) + ".jpg" if row['index'] else ""
+    # Process each configuration separately
+    for config_idx, config in enumerate(PRUNING_CONFIGS):
+        keep_ratio = config['keep_ratio']
+        recovery_ratio = config['recovery_ratio']
         
-        # Format the complete question with options
-        formatted_question = f"Question: {question}\n\nHint: {hint}\n\nOptions:\nA) {option_a}\nB) {option_b}\nC) {option_c}\nD) {option_d}\n\nPlease analyze the image and answer the question."
+        print(f"\n{'='*80}")
+        print(f"PROCESSING CONFIGURATION {config_idx+1}/{len(PRUNING_CONFIGS)}")
+        print(f"keep_ratio={keep_ratio}, recovery_ratio={recovery_ratio}")
+        print(f"{'='*80}")
+        
+        # Initialize results storage for this configuration
+        config_results = []
+        
+        # Run tests for this configuration
+        for i, row in enumerate(sample_data, 1):
+            question = row['question'] if row['question'] else ""
+            hint = row['hint'] if row['hint'] else ""
+            correct_answer = row['answer'] if row['answer'] else ""
+            option_a = row['A'] if row['A'] else ""
+            option_b = row['B'] if row['B'] else ""
+            option_c = row['C'] if row['C'] else ""
+            option_d = row['D'] if row['D'] else ""
+            image_path = "/home/haikai/MMbench/extracted_images/" + str(i-1) + ".jpg" if row['index'] else ""
+            
+            # Format the complete question with options
+            formatted_question = f"Question: {question}\n\nHint: {hint}\n\nOptions:\nA) {option_a}\nB) {option_b}\nC) {option_c}\nD) {option_d}\n\nPlease analyze the image and answer the question."
 
-        print(f"Test {i}/{len(sample_data)}: {image_path}")
-        print(f"Question: {question}")
-        print(f"Correct Answer: {correct_answer}")
-        
-        # Initialize result record for this iteration
-        result_record = {
-            'test_number': i,
-            'total_tests': len(sample_data),
-            'sample_image_path': image_path,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'embed_time': 0,
-            'api_call_time': 0,
-            'total_time': 0,
-            'api_success': False,
-            'generated_text': '',
-            'predicted_answer': '',
-            'is_correct': False,
-            'error_message': '',
-            'full_response': '',
-            'model_path': MODEL_PATH,
-            'original_token': 0,
-            'pruned_token': 0,
-            'api_url': API_URL,
-            'method': 'embeddings'
-        }
-        
-        try:
-            if True:
-                # Embedding method - use existing pruning logic
+            print(f"Test {i}/{len(sample_data)}: {image_path}")
+            print(f"Question: {question}")
+            print(f"Correct Answer: {correct_answer}")
+            
+            # Initialize result record for this iteration
+            result_record = {
+                'test_number': i,
+                'total_tests': len(sample_data),
+                'sample_image_path': image_path,
+                'keep_ratio': keep_ratio,
+                'recovery_ratio': recovery_ratio,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'embed_time': 0,
+                'api_call_time': 0,
+                'total_time': 0,
+                'api_success': False,
+                'generated_text': '',
+                'predicted_answer': '',
+                'is_correct': False,
+                'error_message': '',
+                'full_response': '',
+                'model_path': MODEL_PATH,
+                'original_token': 576,
+                'pruned_token': 0,
+                'api_url': API_URL,
+                'method': 'pruned_embeddings',
+                'question': question,
+                'correct_answer': correct_answer
+            }
+            
+            try:
                 prune_time_begin = time.time()
-                reduced_tokens = getPrunedVisualToken(model, image_path, formatted_question)
-                #reduced_tokens = getOriginalVisualToken(model, image_path, formatted_question)
+                reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
+                    model, 
+                    image_path, 
+                    formatted_question,
+                    keep_ratio=keep_ratio,
+                    recovery_ratio=recovery_ratio
+                )
                 prune_time_end = time.time()
 
                 embed_time = prune_time_end - prune_time_begin
                 result_record['original_token'] = 576
                 result_record['pruned_token'] = reduced_tokens.shape[1]
-                result_record['preprocess_time'] = 0
-                result_record['encode_time'] = 0
-                result_record['project_time'] = 0
-                result_record['prune_time'] = 0
+                result_record['embed_time'] = embed_time
 
+                # Call API
                 api_time_begin = time.time()
                 response = call_vllm_api(
                     image_embedding=reduced_tokens.to(torch.float16),
@@ -819,77 +1160,94 @@ if __name__ == "__main__":
                     use_image_path=False
                 )
                 api_time_end = time.time()
-            
-            api_call_time = api_time_end - api_time_begin
-            result_record['embed_time'] = embed_time
-            result_record['api_call_time'] = api_call_time
-            result_record['total_time'] = embed_time + api_call_time
-            
-            if response:
-                result_record['api_success'] = True
-                print(f"embed time: {embed_time:.2f} seconds")
-                print(f"api call time: {api_call_time:.2f} seconds")
-                print("=" * 60)
-                print("API RESPONSE:")
-                print("=" * 60)
                 
-                if 'choices' in response and len(response['choices']) > 0:
-                    content = response['choices'][0]['message']['content']
-                    result_record['generated_text'] = content
+                api_call_time = api_time_end - api_time_begin
+                result_record['api_call_time'] = api_call_time
+                result_record['total_time'] = embed_time + api_call_time
+                
+                if response:
+                    result_record['api_success'] = True
+                    print(f"embed time: {embed_time:.2f} seconds")
+                    print(f"api call time: {api_call_time:.2f} seconds")
+                    print(f"pruned tokens: {result_record['pruned_token']}")
+                    print("=" * 60)
+                    print("API RESPONSE:")
+                    print("=" * 60)
                     
-                    # Extract predicted answer (A, B, C, or D)
-                    predicted_answer = ""
-                    content_upper = content.upper().strip()
-                    if content_upper in ['A', 'B', 'C', 'D']:
-                        predicted_answer = content_upper
-                    elif 'A)' in content_upper or content_upper.startswith('A'):
-                        predicted_answer = 'A'
-                    elif 'B)' in content_upper or content_upper.startswith('B'):
-                        predicted_answer = 'B'
-                    elif 'C)' in content_upper or content_upper.startswith('C'):
-                        predicted_answer = 'C'
-                    elif 'D)' in content_upper or content_upper.startswith('D'):
-                        predicted_answer = 'D'
-                    
-                    result_record['predicted_answer'] = predicted_answer
-                    result_record['is_correct'] = (predicted_answer == correct_answer.upper())
-                    
-                    print(f"Generated text: {content}")
-                    print(f"Predicted answer: {predicted_answer}")
-                    print(f"Correct answer: {correct_answer}")
-                    print(f"Is correct: {result_record['is_correct']}")
+                    if 'choices' in response and len(response['choices']) > 0:
+                        content = response['choices'][0]['message']['content']
+                        result_record['generated_text'] = content
+                        
+                        # Extract predicted answer (A, B, C, or D)
+                        predicted_answer = ""
+                        content_upper = content.upper().strip()
+                        if content_upper in ['A', 'B', 'C', 'D']:
+                            predicted_answer = content_upper
+                        elif 'A)' in content_upper or content_upper.startswith('A'):
+                            predicted_answer = 'A'
+                        elif 'B)' in content_upper or content_upper.startswith('B'):
+                            predicted_answer = 'B'
+                        elif 'C)' in content_upper or content_upper.startswith('C'):
+                            predicted_answer = 'C'
+                        elif 'D)' in content_upper or content_upper.startswith('D'):
+                            predicted_answer = 'D'
+                        
+                        result_record['predicted_answer'] = predicted_answer
+                        result_record['is_correct'] = (predicted_answer == correct_answer.upper())
+                        
+                        print(f"Generated text: {content}")
+                        print(f"Predicted answer: {predicted_answer}")
+                        print(f"Correct answer: {correct_answer}")
+                        print(f"Is correct: {result_record['is_correct']}")
+                    else:
+                        result_record['full_response'] = json.dumps(response, indent=2)
+                        print(f"Full response: {json.dumps(response, indent=2)}")
                 else:
-                    result_record['full_response'] = json.dumps(response, indent=2)
-                    print(f"Full response: {json.dumps(response, indent=2)}")
-            else:
+                    result_record['api_success'] = False
+                    result_record['error_message'] = "Failed to get response from vLLM API"
+                    print("Failed to get response from vLLM API")
+                    
+            except Exception as e:
                 result_record['api_success'] = False
-                result_record['error_message'] = "Failed to get response from vLLM API"
-                print("Failed to get response from vLLM API")
-                
-        except Exception as e:
-            result_record['api_success'] = False
-            result_record['error_message'] = str(e)
-            print(f"Error processing test {i}: {e}")
-            import traceback
-            traceback.print_exc()
+                result_record['error_message'] = str(e)
+                print(f"Error processing test {i}: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Add the result to our configuration data list
+            config_results.append(result_record)
+            print("-" * 40)
+
+        # Save results for this configuration immediately
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        config_filename = f"MMBench_pruning_results_keep{keep_ratio}_recovery{recovery_ratio}_{timestamp}.csv"
+        save_results_to_csv(config_results, config_filename)
         
-        # Add the result to our data list
-        results_data.append(result_record)
-        print()
-
-
-    # Save results to CSV
-    csv_filename = f"api_timing_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    save_results_to_csv(results_data, csv_filename)
+        # Print summary for this configuration
+        successful_tests = [r for r in config_results if r['api_success']]
+        if successful_tests:
+            total_correct = sum(1 for r in successful_tests if r['is_correct'])
+            accuracy = total_correct / len(successful_tests)
+            avg_embed_time = sum(r['embed_time'] for r in successful_tests) / len(successful_tests)
+            avg_api_time = sum(r['api_call_time'] for r in successful_tests) / len(successful_tests)
+            avg_pruned_tokens = sum(r['pruned_token'] for r in successful_tests) / len(successful_tests)
+            token_reduction = ((576 - avg_pruned_tokens) / 576 * 100)
+            
+            print(f"\nCONFIGURATION {config_idx+1} SUMMARY:")
+            print(f"keep_ratio={keep_ratio}, recovery_ratio={recovery_ratio}")
+            print(f"Samples: {len(config_results)}")
+            print(f"Successful: {len(successful_tests)}")
+            print(f"Accuracy: {accuracy:.2%} ({total_correct}/{len(successful_tests)})")
+            print(f"Avg Embed Time: {avg_embed_time:.2f}s")
+            print(f"Avg API Time: {avg_api_time:.2f}s")
+            print(f"Avg Pruned Tokens: {avg_pruned_tokens:.1f}")
+            print(f"Token Reduction: {token_reduction:.1f}%")
+            print(f"Results saved to: {config_filename}")
+        
+        print(f"\n{'-'*80}")
+        print(f"Completed configuration {config_idx+1}/{len(PRUNING_CONFIGS)}")
+        print(f"{'-'*80}")
     
-    # Generate and display timing summary
-    generate_timing_summary(results_data)
-     # Calculate accuracy
-    successful_tests = [r for r in results_data if r['api_success'] and r['predicted_answer']]
-    if successful_tests:
-        accuracy = sum(1 for r in successful_tests if r['is_correct']) / len(successful_tests)
-        print(f"\nOverall Accuracy: {accuracy:.2%} ({sum(1 for r in successful_tests if r['is_correct'])}/{len(successful_tests)})")
-
-
-
-    #pruned_features = getPrunedVisualToken(model, IMAGE_PATH, TEXTS, keep_ratio=0.125, lambda_val=0.1)
+    print(f"\nAll configurations completed!")
+    print(f"Each configuration's results saved to separate CSV files with naming pattern:")
+    print(f"pruning_results_keep[RATIO]_recovery[RATIO]_[TIMESTAMP].csv")
