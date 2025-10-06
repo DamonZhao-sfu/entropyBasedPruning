@@ -18,7 +18,7 @@ from datetime import datetime
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 from cdencoder import CLIPVisionTower
 
-vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
 
 class MockArgs:
     def __init__(self):
@@ -28,6 +28,26 @@ class MockArgs:
 mock_args = MockArgs()
 vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
 vision_tower = vision_tower.to("cuda")
+vision_tower.vision_tower.config._attn_implementation = "eager"
+vision_tower.vision_tower.config.output_attentions = True
+
+MODEL_PATH = "/scratch/hpc-prf-haqc/haikai/hf-cache/llava-1.5-7b-hf"
+PARQUET_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAv2/validation-00000-of-00068.parquet"  # Update this path
+API_URL = "http://localhost:8000"
+
+# Define different configurations to test
+PRUNING_CONFIGS = [
+    {'keep_ratio': 0.25, 'recovery_ratio': 0},
+]
+
+model = LlavaForConditionalGeneration.from_pretrained(
+    MODEL_PATH, 
+    torch_dtype=torch.float16, 
+    device_map="cuda",
+    attn_implementation="eager"
+)
+
+processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
 
 
 def extract_guided_choices_from_answers(answers_data):
@@ -778,35 +798,7 @@ def getOriginalVisualToken(model, image_binary, texts, keep_ratio=0.25, importan
 
 
 
-if __name__ == "__main__":
-    MODEL_PATH = "/data/models/llava-1.5-7b-hf"
-    PARQUET_PATH = "vqa.parquet"  # Update this path
-    API_URL = "http://localhost:8005"
-
-    # Define different configurations to test
-    PRUNING_CONFIGS = [
-        {'keep_ratio': 0.056, 'recovery_ratio': 0.05},
-        {'keep_ratio': 0.056, 'recovery_ratio': 0.1},
-        {'keep_ratio': 0.22, 'recovery_ratio': 0},
-        {'keep_ratio': 0.11, 'recovery_ratio': 0},
-        {'keep_ratio': 0.22, 'recovery_ratio': 0.05},
-        {'keep_ratio': 0.11, 'recovery_ratio': 0.05},
-        {'keep_ratio': 0.22, 'recovery_ratio': 0.1},
-        {'keep_ratio': 0.11, 'recovery_ratio': 0.1},
-    ]
-
-    # Load the model
-    model = LlavaForConditionalGeneration.from_pretrained(
-        MODEL_PATH, 
-        torch_dtype=torch.float16, 
-        device_map="cuda",
-        attn_implementation="eager"
-    )
-
-    processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
-    
-    print("Loading VQA dataset...")
-    
+if __name__ == "__main__":    
     try:
         df = pd.read_parquet(PARQUET_PATH)
         print(f"Loaded {len(df)} samples from VQA dataset")
@@ -882,16 +874,7 @@ if __name__ == "__main__":
                     print(f"  🔧 Pruning image with combined guidance...")
                     embed_start = time.time()
                     
-                    reduced_tokens = getOriginalVisualToken(
-                        model,
-                        image_binary,
-                        combined_guidance,  # Use combined questions as guidance
-                        keep_ratio=keep_ratio,
-                        important_ratio=0.6,
-                        recovery_ratio=recovery_ratio
-                    )
-
-                    # reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
+                    # reduced_tokens = getOriginalVisualToken(
                     #     model,
                     #     image_binary,
                     #     combined_guidance,  # Use combined questions as guidance
@@ -899,6 +882,15 @@ if __name__ == "__main__":
                     #     important_ratio=0.6,
                     #     recovery_ratio=recovery_ratio
                     # )
+
+                    reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
+                        model,
+                        image_binary,
+                        combined_guidance,  # Use combined questions as guidance
+                        keep_ratio=keep_ratio,
+                        important_ratio=0.6,
+                        recovery_ratio=recovery_ratio
+                    )
                     
                     embed_end = time.time()
                     embed_time = embed_end - embed_start
@@ -1002,7 +994,7 @@ if __name__ == "__main__":
                         response = call_vllm_api_with_embeds(
                             image_embedding=cached_tokens.to(torch.float16),
                             question=question,  # Individual question
-                            model="/data/models/llava-1.5-7b-hf",
+                            model="llava-hf/llava-1.5-7b-hf",
                             api_url=API_URL,
                             guided_choice=guided_choices  # NEW: Pass guided choices
                         )

@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from cdencoder import CLIPVisionTower
@@ -29,8 +28,27 @@ class MockArgs:
 mock_args = MockArgs()
 vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
 vision_tower = vision_tower.to("cuda")
+vision_tower.vision_tower.config._attn_implementation = "eager"
+vision_tower.vision_tower.config.output_attentions = True
 
+MODEL_PATH = "/scratch/hpc-prf-haqc/haikai/hf-cache/llava-1.5-7b-hf"
+POPE_PARQUET_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"  # Update this path
+API_URL = "http://localhost:8000"
 
+# Define different configurations to test
+PRUNING_CONFIGS = [
+    {'keep_ratio': 0.25, 'recovery_ratio': 0},
+]
+
+# Load the model
+model = LlavaForConditionalGeneration.from_pretrained(
+    MODEL_PATH, 
+    torch_dtype=torch.float16, 
+    device_map="cuda",
+    attn_implementation="eager"
+)
+
+processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
 
 def text_guided_diversity_selection(features, text_weights, num_tokens):
     """
@@ -220,81 +238,25 @@ def compute_pruning_scores(attention_matrix, lambda_val, alpha=0.5):
     
     return scores
 
-class MultiQueryAttention(nn.Module):
-    def __init__(self, embed_dim, num_groups=8, device='cuda', dtype=torch.float16):
-        super().__init__()
-        self.num_groups = num_groups
-        self.embed_dim = embed_dim
-        self.head_dim = embed_dim // num_groups
-        self.query = nn.Linear(embed_dim, embed_dim, bias=False).to(device=device, dtype=dtype)
-        self.key = nn.Linear(embed_dim, self.head_dim, bias=False).to(device=device, dtype=dtype)
-        self.value = nn.Linear(embed_dim, self.head_dim, bias=False).to(device=device, dtype=dtype)
-        self.out = nn.Linear(embed_dim, embed_dim, bias=False).to(device=device, dtype=dtype)
-        print(f"MQA initialized on device: {self.query.weight.device}, dtype: {self.query.weight.dtype}")
-
-    def forward(self, queries, context=None):
-        B, N, D = queries.shape  # B=1, N=num_questions, D=embed_dim
-        queries = queries.to(dtype=torch.float16, device=self.query.weight.device)
-        if context is not None:
-            context = context.to(dtype=torch.float16, device=self.query.weight.device)
-        print(f"MQA input queries dtype: {queries.dtype}, device: {queries.device}")
-        
-        queries = self.query(queries)  # [B, N, D]
-        keys = self.key(queries if context is None else context)  # [B, N, head_dim]
-        values = self.value(queries if context is None else context)  # [B, N, head_dim]
-        
-        # Reshape for grouped attention
-        queries = queries.view(B, N, self.num_groups, self.head_dim)  # [B, N, G, head_dim]
-        keys = keys.view(B, -1, 1, self.head_dim).expand(-1, -1, self.num_groups, -1)  # [B, N, G, head_dim]
-        values = values.view(B, -1, 1, self.head_dim).expand(-1, -1, self.num_groups, -1)
-        
-        # Compute attention scores
-        scores = torch.einsum('bngh,bmgh->bnmg', queries, keys) / (self.head_dim ** 0.5)
-        scores = F.softmax(scores, dim=2)  # [B, N, M, G]
-        out = torch.einsum('bnmg,bmgh->bngh', scores, values)  # [B, N, G, head_dim]
-        out = out.view(B, N, -1)  # [B, N, D]
-        return self.out(out.mean(dim=1, keepdim=True))  # [B, 1, D]
-
-def process_text_efficiently(texts, model, model_device, max_pos=512):
+def getPrunedVisualTokenVisPruner_optimized(model, image_path, texts, keep_ratio=0.125, 
+                                          important_ratio=0.6, recovery_ratio=0.1, text_guidance_weight=0.5):
     """
-    Process a list of texts into embeddings using the LLaVA model's tokenizer and text encoder.
+    Highly optimized version of VisPruner with multiple speedup techniques:
+    1. Minimized GPU-CPU transfers
+    2. In-place operations where possible  
+    3. Vectorized operations
+    4. Memory-efficient tensor operations
+    5. Early termination optimizations
+    6. Approximate similarity computation for large token sets
     """
-    try:
-        with torch.no_grad():
-            # Tokenize all texts together for batch processing
-            text_inputs = model.text_tokenizer(
-                texts, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=max_pos,
-                padding=True  # Add padding for batch processing
-            )
-            
-            # Move inputs to the correct device
-            text_inputs = {k: v.to(model_device) for k, v in text_inputs.items()}
-            print(f"Text input IDs dtype: {text_inputs['input_ids'].dtype}, device: {text_inputs['input_ids'].device}")
-            
-            # Process through text tower
-            text_outputs = vision_tower.text_tower(**text_inputs)
-            text_embeds = text_outputs.text_embeds  # Shape: [num_questions, embed_dim]
-            
-            print(f"Text embeds shape: {text_embeds.shape}, dtype: {text_embeds.dtype}, device: {text_embeds.device}")
-            return text_embeds
-            
-    except Exception as e:
-        print(f"Text processing failed: {e}")
-        return None
-
-
-def getPrunedVisualTokenVisPruner_optimized(model, image_binary, texts, keep_ratio=0.125, 
-                                           important_ratio=0.6, recovery_ratio=0.1, text_guidance_weight=0.5):
+    
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
     
     model_device = vision_tower.device
     dtype = vision_tower.dtype
-
+    
     # Process image features and get attention from visual encoder
     with torch.no_grad():
         image_forward_outs = vision_tower.vision_tower(
@@ -302,178 +264,158 @@ def getPrunedVisualTokenVisPruner_optimized(model, image_binary, texts, keep_rat
             output_hidden_states=True,
             output_attentions=True
         )
+        
+        # Extract [CLS] attention more efficiently
         attentions = image_forward_outs.attentions
-        cls_attention = attentions[-2].squeeze(0).mean(dim=0)[0, 1:] if len(attentions) > 1 else attentions[-1].squeeze(0).mean(dim=0)[0, 1:]
-        cls_attention = cls_attention.to(dtype=torch.float16, device=model_device)
-        print(f"CLS attention dtype: {cls_attention.dtype}, device: {cls_attention.device}")
+        if len(attentions) > 1:
+            # Use penultimate layer, average across heads in one operation
+            cls_attention = attentions[-2].squeeze(0).mean(dim=0)[0, 1:]  # [num_patches]
+        else:
+            cls_attention = attentions[-1].squeeze(0).mean(dim=0)[0, 1:]
         
         image_outputs = vision_tower.feature_select(image_forward_outs)
-        image_features = image_outputs.to(dtype=torch.float16, device=model_device)  # [B, N, C]
-        print(f"Image features dtype: {image_features.dtype}, device: {image_features.device}")
+        image_features = image_outputs.to(dtype)  # Keep on GPU
     
     B, N, C = image_features.shape
+    
+    # Ensure consistent dtypes - convert image_features to float16 and projector to same device/dtype
+    image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(device=model_device, dtype=torch.float16)
     projected_features = model.multi_modal_projector(image_features)  # [B, N, hidden_dim]
-    projected_features = projected_features.to(dtype=torch.float16, device=model_device)
-    print(f"Projected features dtype: {projected_features.dtype}, device: {projected_features.device}")
 
-    # Pre-calculate token counts
+    # Pre-calculate token counts to avoid repeated calculations
     num_tokens_to_keep = min(int(keep_ratio * N), N)
     num_important_tokens = int(num_tokens_to_keep * important_ratio)
     num_diverse_tokens = num_tokens_to_keep - num_important_tokens
     
+    # Early exit if keeping all tokens
     if num_tokens_to_keep >= N:
-        return projected_features.detach().cpu()
+        image_features = model.multi_modal_projector(image_features)
+        return image_features.detach().cpu()
     
-    # Step 1: Select important tokens
+    # Step 1: Select important tokens (vectorized topk)
     _, important_indices = torch.topk(cls_attention, num_important_tokens, dim=-1)
+    
+    # Create boolean mask for remaining indices (more memory efficient)
     all_mask = torch.ones(N, dtype=torch.bool, device=model_device)
     all_mask[important_indices] = False
     remaining_indices = torch.nonzero(all_mask, as_tuple=True)[0]
     
     begin = time.time()
-    # Step 2: Diverse token selection with MQAF
+    # Step 2: Optimized diverse token selection
     diverse_indices = torch.empty(0, dtype=torch.long, device=model_device)
     
-    if num_diverse_tokens > 0 and len(remaining_indices) > 0 and texts:
-        # Encode individual questions
-        text_embeds = process_text_efficiently(texts, vision_tower, model_device)
-        if text_embeds is None:
-            print("Falling back to visual attention only due to text processing failure")
-            final_scores = cls_attention[remaining_indices]
-        else:
-            # Ensure text_embeds is contiguous and properly shaped
-            text_embeds = text_embeds.contiguous().unsqueeze(0).to(dtype=torch.float16, device=model_device)  # [1, num_questions, embed_dim]
-            print(f"Text embeds shape: {text_embeds.shape}, dtype: {text_embeds.dtype}, device: {text_embeds.device}")
-            
-            # Apply Multi-Query Attention to fuse question embeddings
-            mqa = MultiQueryAttention(embed_dim=text_embeds.shape[-1], device=model_device, dtype=torch.float16)
-            fused_guidance = mqa(text_embeds)  # [1, 1, embed_dim]
-            fused_guidance = fused_guidance.to(dtype=torch.float16, device=model_device)
-            print(f"Fused guidance shape: {fused_guidance.shape}, dtype: {fused_guidance.dtype}, device: {fused_guidance.device}")
-            
-            # Compute text-guided scores for remaining tokens
-            remaining_features = projected_features[:, remaining_indices, :].to(dtype=torch.float16, device=model_device)  # [B, M, hidden_dim]
-            
-            # Handle dimension mismatch more robustly
-            if fused_guidance.shape[-1] != remaining_features.shape[-1]:
-                print(f"Dimension mismatch: fused_guidance {fused_guidance.shape[-1]} vs remaining_features {remaining_features.shape[-1]}")
-                projection = nn.Linear(fused_guidance.shape[-1], remaining_features.shape[-1], bias=False).to(device=model_device, dtype=torch.float16)
-                fused_guidance = projection(fused_guidance)
-                print(f"After projection - Fused guidance shape: {fused_guidance.shape}, dtype: {fused_guidance.dtype}, device: {fused_guidance.device}")
-            
-            # Compute similarity scores
-            text_scores = torch.einsum('btd,bmd->bm', fused_guidance, remaining_features)  # [B, M]
-            text_scores = F.softmax(text_scores, dim=-1)  # [B, M]
-            print(f"Text scores shape: {text_scores.shape}")
-            
-            # Combine with visual attention for final scores
-            remaining_cls_attention = cls_attention[remaining_indices]
-            print(f"Remaining CLS attention shape: {remaining_cls_attention.shape}")
-            print(f"Text scores squeeze shape: {text_scores.squeeze(0).shape}")
-            
-            # Ensure compatible shapes for combination
-            if text_scores.squeeze(0).shape != remaining_cls_attention.shape:
-                print(f"Shape mismatch in final combination: text_scores {text_scores.squeeze(0).shape} vs cls_attention {remaining_cls_attention.shape}")
-                # Handle the mismatch appropriately
-                min_len = min(len(text_scores.squeeze(0)), len(remaining_cls_attention))
-                text_scores_trimmed = text_scores.squeeze(0)[:min_len]
-                remaining_cls_attention_trimmed = remaining_cls_attention[:min_len]
-                final_scores = text_guidance_weight * text_scores_trimmed + (1 - text_guidance_weight) * remaining_cls_attention_trimmed
-            else:
-                final_scores = text_guidance_weight * text_scores.squeeze(0) + (1 - text_guidance_weight) * remaining_cls_attention
-        
-        # Sample diverse tokens
+    if num_diverse_tokens > 0 and len(remaining_indices) > 0:
         if len(remaining_indices) <= num_diverse_tokens:
             diverse_indices = remaining_indices
         else:
-            sampling_probs = final_scores / final_scores.sum()
-            sample_size = min(num_diverse_tokens * 3, len(remaining_indices))
-            sampled_idx = torch.multinomial(sampling_probs, sample_size, replacement=False)
-            diverse_indices = remaining_indices[sampled_idx][:num_diverse_tokens]
-    
+            # For diversity selection, also consider text guidance
+            if texts is not None and text_guidance_weight > 0:
+                # Weight the remaining features by their text relevance
+                remaining_text_scores = text_visual_norm[remaining_indices] if 'text_visual_norm' in locals() else torch.ones(len(remaining_indices), device=model_device)
+                
+                # Apply weighted sampling probability
+                sampling_weights = 0.7 + 0.3 * remaining_text_scores  # Ensure minimum probability
+                sampling_probs = sampling_weights / sampling_weights.sum()
+                
+                # Use approximate sampling for large sets
+                if len(remaining_indices) > 500:
+                    # Sample based on text relevance + randomness
+                    sample_size = min(num_diverse_tokens * 3, len(remaining_indices))
+                    sampled_idx = torch.multinomial(sampling_probs, sample_size, replacement=False)
+                    sampled_indices = remaining_indices[sampled_idx]
+                    
+                    remaining_features = projected_features[0, sampled_indices, :]
+                    remaining_features = F.normalize(remaining_features, p=2, dim=-1)
+                    
+                    diverse_idx = similarity_based_duplicate_removal_fast(
+                        remaining_features, min(num_diverse_tokens, len(sampled_indices))
+                    )
+                    diverse_indices = sampled_indices[diverse_idx]
+                else:
+                    # Full computation with text guidance
+                    remaining_features = projected_features[0, remaining_indices, :]
+                    remaining_features = F.normalize(remaining_features, p=2, dim=-1)
+                    
+                    diverse_idx = text_guided_diversity_selection(
+                        remaining_features, sampling_weights, num_diverse_tokens
+                    )
+                    diverse_indices = remaining_indices[diverse_idx]
+            else:
+                # Original diversity selection without text guidance
+                if len(remaining_indices) > 500:
+                    sample_size = min(num_diverse_tokens * 4, len(remaining_indices))
+                    sampled_idx = torch.randperm(len(remaining_indices), device=model_device)[:sample_size]
+                    sampled_indices = remaining_indices[sampled_idx]
+                    
+                    remaining_features = projected_features[0, sampled_indices, :]
+                    remaining_features = F.normalize(remaining_features, p=2, dim=-1)
+                    
+                    diverse_idx = similarity_based_duplicate_removal_fast(
+                        remaining_features, min(num_diverse_tokens, len(sampled_indices))
+                    )
+                    diverse_indices = sampled_indices[diverse_idx]
+                else:
+                    remaining_features = projected_features[0, remaining_indices, :]
+                    remaining_features = F.normalize(remaining_features, p=2, dim=-1)
+                    
+                    diverse_idx = similarity_based_duplicate_removal_fast(
+                        remaining_features, num_diverse_tokens
+                    )
+                    diverse_indices = remaining_indices[diverse_idx]
+        
     # Combine and sort indices
     selected_indices = torch.cat([important_indices, diverse_indices])
     selected_indices = torch.sort(selected_indices)[0]
+    
+    # Extract selected features
     image_features_selected = projected_features[:, selected_indices, :]
     
     end = time.time()
-    print("step 2 time", end-begin)
-
-    begin = time.time()
-    
-    if texts and recovery_ratio > 0:
-        selected_mask = torch.zeros(N, dtype=torch.bool, device=model_device)
-        selected_mask[selected_indices] = True
-        pruned_indices = torch.nonzero(~selected_mask, as_tuple=True)[0]
-        if len(pruned_indices) > 0:
-            num_tokens_to_recover = min(int(recovery_ratio * N), len(pruned_indices))
-            if num_tokens_to_recover > 0:
-                if 'fused_guidance' in locals():
-                    print("fused_guidance with text_guidance_weight")
-                    fused_guidance = fused_guidance.to(dtype=torch.float16, device=model_device)
-                    pruned_features = projected_features[:, pruned_indices, :].to(dtype=torch.float16, device=model_device)
+    print("step 2" + str(end-begin))
+    if texts is not None and recovery_ratio > 0:
+        # Process text more efficiently
+        text_embeds = process_text_efficiently(texts, vision_tower, model_device)
+        
+        if text_embeds is not None:
+            # Get pruned indices using boolean indexing
+            selected_mask = torch.zeros(N, dtype=torch.bool, device=model_device)
+            selected_mask[selected_indices] = True
+            pruned_indices = torch.nonzero(~selected_mask, as_tuple=True)[0]
+            
+            if len(pruned_indices) > 0:
+                num_tokens_to_recover = min(int(recovery_ratio * N), len(pruned_indices))
+                
+                if num_tokens_to_recover > 0:
+                    # Efficient attention computation
+                    if text_embeds.shape[-1] != projected_features.shape[-1]:  # FIX: Compare with projected_features
+                        # Use smaller projection layer
+                        projection_layer = torch.nn.Linear(
+                            text_embeds.shape[-1], projected_features.shape[-1],  # FIX: Use projected_features dimension
+                            bias=False  # Remove bias for speed
+                        ).to(model_device, dtype=torch.float16)
+                        text_embeds = projection_layer(text_embeds)
                     
-                    # Handle dimension mismatch
-                    if fused_guidance.shape[-1] != pruned_features.shape[-1]:
-                        projection = nn.Linear(fused_guidance.shape[-1], pruned_features.shape[-1], bias=False).to(device=model_device, dtype=torch.float16)
-                        fused_guidance = projection(fused_guidance)
+                    # Compute attention only for pruned tokens (memory efficient)
+                    pruned_features = projected_features[:, pruned_indices, :]  # FIX: Use projected_features instead of image_features
+                    attention_scores = torch.einsum('btc,bpc->btp', text_embeds, pruned_features)
+                    attention_scores = F.softmax(attention_scores, dim=-1).mean(dim=(0, 1))
                     
-                    # Compute text-guided attention scores
-                    text_attention_scores = torch.einsum('btd,bpd->bp', fused_guidance, pruned_features)
-                    text_attention_scores = F.softmax(text_attention_scores, dim=-1).mean(dim=0)
-                    
-                    # Get visual attention scores for pruned tokens
-                    pruned_cls_attention = cls_attention[pruned_indices]
-                    pruned_cls_attention = F.softmax(pruned_cls_attention, dim=-1)  # Normalize visual scores
-                    
-                    # Combine text and visual attention using text_guidance_weight
-                    # Higher text_guidance_weight emphasizes text relevance, lower emphasizes visual importance
-                    combined_scores = (text_guidance_weight * text_attention_scores + 
-                                    (1 - text_guidance_weight) * pruned_cls_attention)
-                    
-                    # Select tokens to recover based on combined scores
-                    _, recovery_idx = torch.topk(combined_scores, num_tokens_to_recover)
+                    # Recover tokens
+                    _, recovery_idx = torch.topk(attention_scores, num_tokens_to_recover)
                     recovery_indices = pruned_indices[recovery_idx]
                     
+                    # Concatenate efficiently - FIX: Use projected_features for recovery
                     image_features_recovered = projected_features[:, recovery_indices, :]
-                    image_features_selected = torch.cat([image_features_selected, image_features_recovered], dim=1)
-                else:
-                    # Fallback to visual attention only if no text guidance available
-                    print("No text guidance available, using visual attention only for recovery")
-                    pruned_cls_attention = cls_attention[pruned_indices]
-                    _, recovery_idx = torch.topk(pruned_cls_attention, num_tokens_to_recover)
-                    recovery_indices = pruned_indices[recovery_idx]
-                    
-                    image_features_recovered = projected_features[:, recovery_indices, :]
-                    image_features_selected = torch.cat([image_features_selected, image_features_recovered], dim=1)
-
-    # if texts and recovery_ratio > 0:
-    #     selected_mask = torch.zeros(N, dtype=torch.bool, device=model_device)
-    #     selected_mask[selected_indices] = True
-    #     pruned_indices = torch.nonzero(~selected_mask, as_tuple=True)[0]
-    #     if len(pruned_indices) > 0:
-    #         num_tokens_to_recover = min(int(recovery_ratio * N), len(pruned_indices))
-    #         if num_tokens_to_recover > 0:
-    #             if 'fused_guidance' in locals():
-    #                 print("fused_guidance")
-    #                 fused_guidance = fused_guidance.to(dtype=torch.float16, device=model_device)
-    #                 pruned_features = projected_features[:, pruned_indices, :].to(dtype=torch.float16, device=model_device)
-    #                 if fused_guidance.shape[-1] != pruned_features.shape[-1]:
-    #                     projection = nn.Linear(fused_guidance.shape[-1], pruned_features.shape[-1], bias=False).to(device=model_device, dtype=torch.float16)
-    #                     fused_guidance = projection(fused_guidance)
-                    
-    #                 attention_scores = torch.einsum('btd,bpd->bp', fused_guidance, pruned_features)
-    #                 attention_scores = F.softmax(attention_scores, dim=-1).mean(dim=0)
-    #                 _, recovery_idx = torch.topk(attention_scores, num_tokens_to_recover)
-    #                 recovery_indices = pruned_indices[recovery_idx]
-                    
-    #                 image_features_recovered = projected_features[:, recovery_indices, :]
-    #                 image_features_selected = torch.cat([image_features_selected, image_features_recovered], dim=1)
-    
+                    image_features_selected = torch.cat(
+                        [image_features_selected, image_features_recovered], dim=1
+                    )
+    # Single GPU-CPU transfer at the end
     result = image_features_selected.detach().cpu()
-    end = time.time()
-    print("step 3 time", end-begin)
+    
+    print(f"Final output shape: {result.shape}")
+    print(f"Kept {result.shape[1]} out of {N} tokens ({result.shape[1]/N*100:.1f}%)")
+    
     return result
 
 
@@ -576,8 +518,10 @@ def cluster_based_selection(features, num_to_keep):
     return torch.tensor(selected_idx[:num_to_keep], device=features.device)
 
 
-
-def process_text_efficiently_v2(texts, vision_tower, model_device):
+def process_text_efficiently(texts, vision_tower, model_device):
+    """
+    Optimized text processing with minimal memory allocation.
+    """
     try:
         with torch.no_grad():
             text_inputs = vision_tower.text_tokenizer(text=texts, return_tensors="pt")
@@ -624,6 +568,7 @@ def process_text_efficiently_v2(texts, vision_tower, model_device):
     except Exception as e:
         print(f"Text processing failed: {e}")
         return None
+
 
 
 def extract_image_binary_from_pope_data(image_data):
@@ -777,30 +722,7 @@ def save_results_to_csv(results_data, filename="tpcds_query_times.csv"):
         traceback.print_exc()
 
 
-if __name__ == "__main__":
-    MODEL_PATH = "/scratch/hpc-prf-haqc/haikai/hf-cache/llava-1.5-7b-hf"
-    POPE_PARQUET_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"  # Update this path
-    API_URL = "http://localhost:8000"
-
-    # Define different configurations to test
-    PRUNING_CONFIGS = [
-        {'keep_ratio': 0.05, 'recovery_ratio': 0.1, 'text_guidance_weight': 0.5},
-        {'keep_ratio': 0.05, 'recovery_ratio': 0.1, 'text_guidance_weight': 1},
-        {'keep_ratio': 0.05, 'recovery_ratio': 0.1, 'text_guidance_weight': 0},
-    ]
-
-    # Load the model
-    model = LlavaForConditionalGeneration.from_pretrained(
-        MODEL_PATH, 
-        torch_dtype=torch.float16, 
-        device_map="cuda",
-        attn_implementation="eager"
-    )
-
-    processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
-    
-    print("Loading POPE dataset...")
-    
+if __name__ == "__main__":    
     try:
         df = pd.read_parquet(POPE_PARQUET_PATH)
         print(f"Loaded {len(df)} samples from POPE dataset")
@@ -828,8 +750,7 @@ if __name__ == "__main__":
         for config_idx, config in enumerate(PRUNING_CONFIGS):
             keep_ratio = config['keep_ratio']
             recovery_ratio = config['recovery_ratio']
-            text_guidance_weight = config['text_guidance_weight']
-
+            
             print(f"\n{'='*80}")
             print(f"PROCESSING CONFIGURATION {config_idx+1}/{len(PRUNING_CONFIGS)}")
             print(f"keep_ratio={keep_ratio}, recovery_ratio={recovery_ratio}")
@@ -883,7 +804,7 @@ if __name__ == "__main__":
                         combined_guidance,  # Use combined questions as guidance
                         keep_ratio=keep_ratio,
                         important_ratio=0.6,
-                        recovery_ratio=recovery_ratio,text_guidance_weight=text_guidance_weight
+                        recovery_ratio=recovery_ratio
                     )
                     
                     embed_end = time.time()
@@ -983,7 +904,7 @@ if __name__ == "__main__":
                         response = call_vllm_api_with_embeds(
                             image_embedding=cached_tokens.to(torch.float16),
                             question=question,  # Individual question
-                            model="/data/models/llava-1.5-7b-hf",
+                            model="llava-hf/llava-1.5-7b-hf",
                             api_url=API_URL
                         )
                         api_end = time.time()
@@ -1050,28 +971,21 @@ if __name__ == "__main__":
                 avg_pruned_tokens = sum(r['pruned_tokens'] for r in successful_tests) / len(successful_tests)
                 token_reduction = ((576 - avg_pruned_tokens) / 576 * 100)
                 
-                summary_text = f"""CONFIGURATION {config_idx+1} SUMMARY:
-                keep_ratio={keep_ratio}, recovery_ratio={recovery_ratio}, text_weight={text_guidance_weight}
-                Unique images processed: {unique_images}
-                Total questions: {len(config_results)}
-                Successful: {len(successful_tests)}
-                Accuracy: {accuracy:.2%} ({total_correct}/{len(successful_tests)})
-                Total Pruning Time: {total_pruning_time:.2f}s
-                Total API Call Time: {total_api_call_time:.2f}s
-                Total Processing Time: {total_pruning_time + total_api_call_time:.2f}s
-                Avg Embed Time (per question): {avg_embed_time:.2f}s
-                Avg API Time: {avg_api_time:.2f}s
-                Avg Pruned Tokens: {avg_pruned_tokens:.1f}
-                Token Reduction: {token_reduction:.1f}%
-                Results saved to: {config_filename}
-                """
-                print(summary_text)
-                # Save to text file (same name as CSV but with .txt extension)
-                text_filename = config_filename.replace('.csv', '.txt')
-                with open(text_filename, 'w') as f:
-                    f.write(summary_text)
-
-
+                print(f"\nCONFIGURATION {config_idx+1} SUMMARY:")
+                print(f"keep_ratio={keep_ratio}, recovery_ratio={recovery_ratio}")
+                print(f"Unique images processed: {unique_images}")
+                print(f"Total questions: {len(config_results)}")
+                print(f"Successful: {len(successful_tests)}")
+                print(f"Accuracy: {accuracy:.2%} ({total_correct}/{len(successful_tests)})")
+                print(f"Total Pruning Time: {total_pruning_time:.2f}s")
+                print(f"Total API Call Time: {total_api_call_time:.2f}s")
+                print(f"Total Processing Time: {total_pruning_time + total_api_call_time:.2f}s")
+                print(f"Avg Embed Time (per question): {avg_embed_time:.2f}s")
+                print(f"Avg API Time: {avg_api_time:.2f}s")
+                print(f"Avg Pruned Tokens: {avg_pruned_tokens:.1f}")
+                print(f"Token Reduction: {token_reduction:.1f}%")
+                print(f"Results saved to: {config_filename}")
+            
             print(f"\n{'-'*80}")
             print(f"Completed configuration {config_idx+1}/{len(PRUNING_CONFIGS)}")
             print(f"{'-'*80}")

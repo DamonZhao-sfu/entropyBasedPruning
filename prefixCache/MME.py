@@ -18,7 +18,7 @@ from datetime import datetime
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 from cdencoder import CLIPVisionTower
 
-vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
 
 class MockArgs:
     def __init__(self):
@@ -28,7 +28,91 @@ class MockArgs:
 mock_args = MockArgs()
 vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
 vision_tower = vision_tower.to("cuda")
+vision_tower.vision_tower.config._attn_implementation = "eager"
+vision_tower.vision_tower.config.output_attentions = True
 
+MODEL_PATH = "/scratch/hpc-prf-haqc/haikai/hf-cache/llava-1.5-7b-hf"
+PARQUET_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/MME/test-00000-of-00002.parquet"  # Update this path
+API_URL = "http://localhost:8000"
+
+# Define different configurations to test
+PRUNING_CONFIGS = [
+    {'keep_ratio': 0.25, 'recovery_ratio': 0},
+]
+
+model = LlavaForConditionalGeneration.from_pretrained(
+    MODEL_PATH, 
+    torch_dtype=torch.float16, 
+    device_map="cuda",
+    attn_implementation="eager"
+)
+
+processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
+
+
+def extract_guided_choices_from_answers(answers_data):
+    """
+    Extract unique answers from the answers data to use as guided_choice
+    
+    Args:
+        answers_data: Can be JSON string, list, numpy array, or pandas Series containing answer objects
+        
+    Returns:
+        list: Unique answer values for guided_choice
+    """
+    try:
+        # Handle different input types
+        if answers_data is None:
+            return None
+            
+        # Check if it's a string (JSON)
+        if isinstance(answers_data, str):
+            if not answers_data.strip():
+                return None
+            try:
+                answers_list = json.loads(answers_data)
+            except json.JSONDecodeError:
+                print(f"  ⚠️  Invalid JSON string: {answers_data[:100]}...")
+                return None
+        
+        # Check if it's already a list or array-like
+        elif hasattr(answers_data, '__iter__') and not isinstance(answers_data, dict):
+            answers_list = list(answers_data)
+        
+        # Handle single dictionary case
+        elif isinstance(answers_data, dict):
+            answers_list = [answers_data]
+        
+        else:
+            print(f"  ⚠️  Unsupported answers_data type: {type(answers_data)}")
+            return None
+        
+        # Extract unique answer values
+        unique_answers = set()
+        for answer_obj in answers_list:
+            if isinstance(answer_obj, dict) and 'answer' in answer_obj:
+                answer_value = str(answer_obj['answer']).strip().lower()
+                if answer_value:  # Only add non-empty answers
+                    unique_answers.add(answer_value)
+            elif isinstance(answer_obj, str):
+                # Handle case where answer_obj is directly a string
+                answer_value = answer_obj.strip().lower()
+                if answer_value:
+                    unique_answers.add(answer_value)
+        
+        # Convert to sorted list for consistency
+        guided_choices = sorted(list(unique_answers))
+        
+        print(f"  📋 Extracted guided choices: {guided_choices}")
+        return guided_choices if guided_choices else None
+        
+    except Exception as e:
+        print(f"  ⚠️  Error parsing answers data: {e}")
+        print(f"  🔍 Answers data type: {type(answers_data)}")
+        print(f"  🔍 Answers data preview: {str(answers_data)[:200]}...")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def text_guided_diversity_selection(features, text_weights, num_tokens):
@@ -84,7 +168,7 @@ def encode_image_embedding_to_base64(image_embedding):
     base64_image_embedding = base64.b64encode(binary_data).decode('utf-8')
     return base64_image_embedding
 
-def call_vllm_api_with_embeds(image_embedding, question="What's in this image?", model="llava-hf/llava-1.5-7b-hf", api_url="http://localhost:8005"):
+def call_vllm_api_with_embeds(image_embedding, question="What's in this image?", model="llava-hf/llava-1.5-7b-hf", api_url="http://localhost:8005", guided_choice=None):
     # Encode image embedding
     base64_image_embedding = encode_image_embedding_to_base64(image_embedding)
     
@@ -111,8 +195,15 @@ def call_vllm_api_with_embeds(image_embedding, question="What's in this image?",
         ],
         "max_tokens": 1024,
         "temperature": 0,
-        "guided_choice": ["yes", "no"]  # For POPE yes/no questions
     }
+    
+    # Add guided_choice if provided
+    if guided_choice and isinstance(guided_choice, list) and len(guided_choice) > 0:
+        payload["guided_choice"] = guided_choice
+        print(f"  🎯 Using guided_choice: {guided_choice}")
+    else:
+        # Default fallback for yes/no questions
+        payload["guided_choice"] = ["yes", "no"]
     
     headers = {
         "Content-Type": "application/json"
@@ -553,9 +644,6 @@ def process_text_efficiently(texts, vision_tower, model_device):
 
 
 def extract_image_binary_from_pope_data(image_data):
-    """
-    Extract binary data from POPE dataset image column
-    """
     if isinstance(image_data, dict):
         # Look for bytes in dictionary
         if 'bytes' in image_data:
@@ -612,34 +700,6 @@ def print_configuration_summary(all_results):
             print(f"  Token Reduction: {token_reduction:.1f}%")
 
 
-def getOriginalVisualToken(model, image_binary, texts, keep_ratio=0.25, lambda_val=0.1, recovery_ratio=0.1):
-    # Load and preprocess image
-    image = Image.open(io.BytesIO(image_binary))
-    inputs = vision_tower.image_processor(image, return_tensors="pt")
-    images = inputs["pixel_values"]
-    image_stream = torch.cuda.Stream()
-    text_stream = torch.cuda.Stream()
-    
-    model_device = vision_tower.device
-    
-    # Process image features
-    with torch.cuda.stream(image_stream):
-        image_forward_outs = vision_tower.vision_tower(
-            images.to(device=model_device, dtype=vision_tower.dtype),
-            output_hidden_states=True,
-            output_attentions=True
-        )
-        image_outputs = vision_tower.feature_select(image_forward_outs)
-        image_features = image_outputs.to(images.dtype)
-      
-    torch.cuda.synchronize()
-    
-    B, N, C = image_features.shape
-    image_features = image_features.to(device=model_device, dtype=torch.float16)
-    model.multi_modal_projector = model.multi_modal_projector.to(model_device)
-    image_features = model.multi_modal_projector(image_features).detach().cpu()
-    return image_features
-
 def save_results_to_csv(results_data, filename="tpcds_query_times.csv"):
     """
     Save query results data to CSV file with correct headers
@@ -675,7 +735,8 @@ def save_results_to_csv(results_data, filename="tpcds_query_times.csv"):
         'preprocess_time',
         'encode_time',
         'project_time',
-        'prune_time'
+        'prune_time',
+        'guided_choices_used'
     ]
     
     try:
@@ -703,38 +764,45 @@ def save_results_to_csv(results_data, filename="tpcds_query_times.csv"):
         traceback.print_exc()
 
 
-if __name__ == "__main__":
-    MODEL_PATH = "/data/models/llava-1.5-7b-hf"
-    POPE_PARQUET_PATH = "POPE.parquet"  # Update this path
-    API_URL = "http://localhost:8005"
-
-    # Define different configurations to test
-    PRUNING_CONFIGS = [
-        #{'keep_ratio': 0.05, 'recovery_ratio': 0},
-        # {'keep_ratio': 0.1, 'recovery_ratio': 0},
-        {'keep_ratio': 0.25, 'recovery_ratio': 0},
-    ]
-
-    # Load the model
-    model = LlavaForConditionalGeneration.from_pretrained(
-        MODEL_PATH, 
-        torch_dtype=torch.float16, 
-        device_map="cuda",
-        attn_implementation="eager"
-    )
-
-    processor = LlavaProcessor.from_pretrained(MODEL_PATH, patch_size=14)
+def getOriginalVisualToken(model, image_binary, texts, keep_ratio=0.25, important_ratio=0.1, recovery_ratio=0.1):
+    # Load and preprocess image
+    image = Image.open(io.BytesIO(image_binary))
+    inputs = vision_tower.image_processor(image, return_tensors="pt")
+    images = inputs["pixel_values"]
+    image_stream = torch.cuda.Stream()
+    text_stream = torch.cuda.Stream()
     
-    print("Loading POPE dataset...")
+    model_device = vision_tower.device
     
+    # Process image features
+    with torch.cuda.stream(image_stream):
+        image_forward_outs = vision_tower.vision_tower(
+            images.to(device=model_device, dtype=vision_tower.dtype),
+            output_hidden_states=True,
+            output_attentions=True
+        )
+        image_outputs = vision_tower.feature_select(image_forward_outs)
+        image_features = image_outputs.to(images.dtype)
+      
+    torch.cuda.synchronize()
+    
+    B, N, C = image_features.shape
+    image_features = image_features.to(device=model_device, dtype=torch.float16)
+    model.multi_modal_projector = model.multi_modal_projector.to(model_device)
+    image_features = model.multi_modal_projector(image_features).detach().cpu()
+    return image_features
+
+
+
+if __name__ == "__main__":    
     try:
-        df = pd.read_parquet(POPE_PARQUET_PATH)
-        print(f"Loaded {len(df)} samples from POPE dataset")
+        df = pd.read_parquet(PARQUET_PATH)
+        print(f"Loaded {len(df)} samples from VQA dataset")
         print(f"Columns: {list(df.columns)}")
         
         # Group data by image_source to optimize pruning
         print("\nGrouping questions by image source...")
-        image_groups = df.groupby('image_source')
+        image_groups = df.groupby('question_id')
         unique_images = len(image_groups)
         
         print(f"Found {unique_images} unique images")
@@ -742,7 +810,7 @@ if __name__ == "__main__":
         print(f"Total evaluations: {len(df) * len(PRUNING_CONFIGS)}")
         
         # Display image source distribution
-        image_counts = df.groupby('image_source').size().sort_values(ascending=False)
+        image_counts = df.groupby('question_id').size().sort_values(ascending=False)
         print(f"\nTop 10 most frequently used images:")
         for img_source, count in image_counts.head(10).items():
             print(f"  {img_source}: {count} questions")
@@ -801,7 +869,8 @@ if __name__ == "__main__":
                     # Prune image ONCE using ALL questions as guidance
                     print(f"  🔧 Pruning image with combined guidance...")
                     embed_start = time.time()
-                    
+                
+
                     reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
                         model,
                         image_binary,
@@ -841,11 +910,11 @@ if __name__ == "__main__":
             print(f"❌ Failed to prune {unique_images - len(pruned_image_cache)} images")
             print("-" * 80)
             print("Total pruning time" + str(total_pruning_time))
-            # # STEP 2: Process all questions using cached pruned images
+            
+            # STEP 2: Process all questions using cached pruned images
             print(f"\nSTEP 2: Processing questions using pruned images...")
             total_questions_processed = 0
                 
-            
             # Now process ALL questions using their corresponding cached pruned images
             for image_idx, (image_source, image_group) in enumerate(image_groups):
                 # Skip if this image was not successfully pruned
@@ -871,11 +940,15 @@ if __name__ == "__main__":
                     question = row.get('question', '')
                     correct_answer = row.get('answer', '').lower().strip()
                     category = row.get('category', 'unknown')
+                    answers_json = row.get('answers', '')  # NEW: Get the answers JSON string
                     
                     total_questions_processed += 1
                     print(f"  [{total_questions_processed}/{len(df)}] Q{q_idx+1}: {question_id}")
                     print(f"    Question: {question}")
                     print(f"    Expected: {correct_answer}")
+                    
+                    # NEW: Extract guided choices from answers data
+                    guided_choices = extract_guided_choices_from_answers(answers_json)
                     
                     # Initialize result record
                     result_record = {
@@ -899,17 +972,19 @@ if __name__ == "__main__":
                         'questions_used_for_pruning': cached_data['num_questions_used'],
                         'total_pruning_time_config': 0,  # Will be filled after all processing
                         'total_api_call_time_config': 0,  # Will be filled after all processing
+                        'guided_choices_used': "['yes', 'no']",  # NEW: Track guided choices
                         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
                     
                     try:
-                        # 🚀 Call vLLM API with the cached pruned image
+                        # 🚀 Call vLLM API with the cached pruned image and guided choices
                         api_start = time.time()
                         response = call_vllm_api_with_embeds(
                             image_embedding=cached_tokens.to(torch.float16),
                             question=question,  # Individual question
-                            model="/data/models/llava-1.5-7b-hf",
-                            api_url=API_URL
+                            model="llava-hf/llava-1.5-7b-hf",
+                            api_url=API_URL,
+                            guided_choice=guided_choices  # NEW: Pass guided choices
                         )
                         api_end = time.time()
                         
@@ -920,25 +995,57 @@ if __name__ == "__main__":
                         # Add to total API call time
                         total_api_call_time += api_call_time
                         
+                        # Replace your current answer extraction logic with this:
+
                         if response and 'choices' in response and len(response['choices']) > 0:
                             result_record['api_success'] = True
                             content = response['choices'][0]['message']['content']
                             result_record['generated_text'] = content
                             
-                            # Extract yes/no answer
+                            # Extract answer - improved logic for guided choices
                             content_lower = content.lower().strip()
-                            if 'yes' in content_lower:
-                                predicted_answer = 'yes'
-                            elif 'no' in content_lower:
-                                predicted_answer = 'no'
-                            else:
-                                predicted_answer = content_lower
                             
-                            result_record['predicted_answer'] = predicted_answer
-                            result_record['is_correct'] = (predicted_answer == correct_answer)
+                            # Debug: Print the values for comparison
+                            print(f"    🔍 Debug - Generated content: '{content}'")
+                            print(f"    🔍 Debug - Content lower: '{content_lower}'")
+                            print(f"    🔍 Debug - Correct answer: '{correct_answer}'")
+                            print(f"    🔍 Debug - Guided choices: {guided_choices}")
+                            
+                            # If we have guided choices, try to match against them first
+                            if guided_choices:
+                                predicted_answer = content_lower.strip()  # Start with cleaned content
+                                for choice in guided_choices:
+                                    choice_clean = choice.lower().strip()
+                                    if choice_clean in content_lower:
+                                        predicted_answer = choice_clean
+                                        print(f"    🎯 Matched guided choice: '{choice_clean}'")
+                                        break
+                                else:
+                                    print(f"    ⚠️  No guided choice matched, using raw content: '{predicted_answer}'")
+                            else:
+                                # Fallback to yes/no logic
+                                if 'yes' in content_lower:
+                                    predicted_answer = 'yes'
+                                elif 'no' in content_lower:
+                                    predicted_answer = 'no'
+                                else:
+                                    predicted_answer = content_lower.strip()
+                            
+                            # Clean both answers for comparison
+                            predicted_clean = predicted_answer.strip()
+                            correct_clean = correct_answer.strip()
+                            
+                            result_record['predicted_answer'] = predicted_clean
+                            result_record['is_correct'] = (predicted_clean == correct_clean)
+                            
+                            # Debug: Print the final comparison
+                            print(f"    🔍 Debug - Final predicted: '{predicted_clean}'")
+                            print(f"    🔍 Debug - Final correct: '{correct_clean}'")
+                            print(f"    🔍 Debug - Are equal: {predicted_clean == correct_clean}")
+                            print(f"    🔍 Debug - Lengths - predicted: {len(predicted_clean)}, correct: {len(correct_clean)}")
                             
                             print(f"    🤖 Generated: {content}")
-                            print(f"    📊 Predicted: {predicted_answer} | Correct: {result_record['is_correct']} | API: {api_call_time:.2f}s")
+                            print(f"    📊 Predicted: {predicted_clean} | Correct: {result_record['is_correct']} | API: {api_call_time:.2f}s")
                             
                         else:
                             result_record['error_message'] = "No valid response from API"
@@ -962,7 +1069,7 @@ if __name__ == "__main__":
             
             # Save results for this configuration
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            config_filename = f"pope_results_optimized_keep{keep_ratio}_recovery{recovery_ratio}_{timestamp}.csv"
+            config_filename = f"VQA_results_optimized_keep{keep_ratio}_recovery{recovery_ratio}_{timestamp}.csv"
             save_results_to_csv(config_results, config_filename)
             
             # Print summary for this configuration
@@ -998,7 +1105,7 @@ if __name__ == "__main__":
         
         # Save combined results file
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        combined_csv_filename = f"pope_all_configs_optimized_{timestamp}.csv"
+        combined_csv_filename = f"vqa_all_configs_optimized_{timestamp}.csv"
         save_results_to_csv(all_results, combined_csv_filename)
         
         # Print final summary
@@ -1019,6 +1126,6 @@ if __name__ == "__main__":
             print(f"Pruning Efficiency: Each image pruned once and reused for multiple questions")
 
     except Exception as e:
-        print(f"Error loading POPE dataset: {e}")
+        print(f"Error loading VQA dataset: {e}")
         import traceback
         traceback.print_exc()
