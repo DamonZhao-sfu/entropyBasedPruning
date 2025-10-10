@@ -168,14 +168,15 @@ def encode_image_embedding_to_base64(image_embedding):
     base64_image_embedding = base64.b64encode(binary_data).decode('utf-8')
     return base64_image_embedding
 
-def call_vllm_api_with_embeds(image_embedding, question="What's in this image?", model="llava-hf/llava-1.5-7b-hf", api_url="http://localhost:8005", guided_choice=None):
+def call_vllm_api_with_embeds(image_embedding, question="What's in this image?", model="llava-hf/llava-1.5-7b-hf", api_url="http://localhost:8005", guided_choice=None, image_uuid=None):
     # Encode image embedding
     base64_image_embedding = encode_image_embedding_to_base64(image_embedding)
     
     # Prepare the request payload
     embeds = {
         "type": "image_embeds",
-        "image_embeds": base64_image_embedding
+        "image_embeds": base64_image_embedding,
+        "uuid": image_uuid,
     }
     
     payload = {
@@ -950,6 +951,7 @@ if __name__ == "__main__":
                 for q_idx, (_, row) in enumerate(questions_for_image.iterrows()):
                     question_id = row.get('question_id', f'q_{row.name}')
                     question = row.get('question', '')
+                    image_id = row.get('image_id', '')
                     correct_answer = row.get('multiple_choice_answer', '').lower().strip()
                     category = row.get('category', 'unknown')
                     answers_json = row.get('answers', '')  # NEW: Get the answers JSON string
@@ -996,7 +998,8 @@ if __name__ == "__main__":
                             question=question,  # Individual question
                             model="llava-hf/llava-1.5-7b-hf",
                             api_url=API_URL,
-                            guided_choice=guided_choices  # NEW: Pass guided choices
+                            guided_choice=guided_choices,  # NEW: Pass guided choices
+                            image_uuid=image_id,
                         )
                         api_end = time.time()
                         

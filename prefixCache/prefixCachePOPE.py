@@ -103,14 +103,15 @@ def encode_image_embedding_to_base64(image_embedding):
     base64_image_embedding = base64.b64encode(binary_data).decode('utf-8')
     return base64_image_embedding
 
-def call_vllm_api_with_embeds(image_embedding, question="What's in this image?", model="llava-hf/llava-1.5-7b-hf", api_url="http://localhost:8005"):
+def call_vllm_api_with_embeds(image_embedding, question="What's in this image?", model="llava-hf/llava-1.5-7b-hf", api_url="http://localhost:8000",uuid=""):
     # Encode image embedding
     base64_image_embedding = encode_image_embedding_to_base64(image_embedding)
     
     # Prepare the request payload
     embeds = {
         "type": "image_embeds",
-        "image_embeds": base64_image_embedding
+        "image_embeds": base64_image_embedding,
+        "uuid": uuid,
     }
     
     payload = {
@@ -865,6 +866,7 @@ if __name__ == "__main__":
                 for q_idx, (_, row) in enumerate(questions_for_image.iterrows()):
                     question_id = row.get('question_id', f'q_{row.name}')
                     question = row.get('question', '')
+                    uuid = row.get('image_source', '')
                     correct_answer = row.get('answer', '').lower().strip()
                     category = row.get('category', 'unknown')
                     
@@ -905,7 +907,8 @@ if __name__ == "__main__":
                             image_embedding=cached_tokens.to(torch.float16),
                             question=question,  # Individual question
                             model="llava-hf/llava-1.5-7b-hf",
-                            api_url=API_URL
+                            api_url=API_URL,
+                            uuid=uuid,
                         )
                         api_end = time.time()
                         
